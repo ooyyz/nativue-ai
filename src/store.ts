@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
-import type { Config, Snapshot } from "./types.ts";
+import type { Config, Snapshot, JavaSourceScope } from "./types.ts";
 export const defaultConfig = (): Config => ({
   schemaVersion: 1,
   language: "en",
@@ -89,6 +89,30 @@ export function validateConfig(c: Config) {
     typeof c.analysis.enabled !== "boolean"
   )
     throw Error("Invalid remote/analysis configuration");
+  if (c.java) {
+    const safePath = (s: unknown) => typeof s === "string" && s.length > 0 &&
+      !path.isAbsolute(s) && !s.includes("\\") && !s.split("/").some(p => p === ".." || p.startsWith(".git") || p === ".nativue");
+    const validScope = (scope: JavaSourceScope) => scope && Array.isArray(scope.roots) && scope.roots.every(safePath) &&
+      (scope.parentId === undefined || (typeof scope.parentId === "string" && !!scope.parentId)) &&
+      (scope.kind === undefined || (typeof scope.kind === "string" && /^[a-z][a-z0-9-]*$/.test(scope.kind))) &&
+      Array.isArray(scope.features) && scope.features.every(f => f && typeof f.id === "string" && /^[\w.-]+$/.test(f.id) &&
+        !["shared", "unassigned"].includes(f.id) && typeof f.name === "string" && f.name.trim() && Array.isArray(f.seeds) && f.seeds.length && f.seeds.every(s => typeof s === "string" && s.length > 0));
+    const uniqueRules = (scope: JavaSourceScope) => new Set(scope.features.map(f => f.id)).size === scope.features.length;
+    const scopes = c.java.scopes;
+    if (typeof c.java.enabled !== "boolean" || !validScope(c.java) || !uniqueRules(c.java) ||
+        (scopes !== undefined && (!Array.isArray(scopes) || !scopes.every(scope => validScope(scope) && uniqueRules(scope) &&
+          typeof scope.id === "string" && /^[\w.-]+$/.test(scope.id) && typeof scope.name === "string" && !!scope.name.trim() && scope.roots.length > 0) ||
+          new Set(scopes.map(scope => scope.id)).size !== scopes.length)))
+      throw Error("Invalid Java source analysis configuration");
+    if (scopes?.length) {
+      const all = [c.java, ...scopes];
+      const parents = all.map(scope => scope.parentId).filter(Boolean);
+      if (!c.java.roots.length || new Set(parents).size !== parents.length || all.some((a,i) => all.some((b,j) => i < j && a.roots.some(x => b.roots.some(y => {
+        const p=x.replace(/\/$/,""), q=y.replace(/\/$/,"");
+        return p === q || p.startsWith(q+"/") || q.startsWith(p+"/");
+      }))))) throw Error("Java scopes must have distinct roots and parents / Java 建图范围及挂载点不能重叠");
+    }
+  }
 }
 export function saveConfig(root: string, c: Config) {
   validateConfig(c);

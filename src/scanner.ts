@@ -173,10 +173,14 @@ export async function scanWorkspace(
     branch: string | null = null,
     dirty = false;
   let extra: string[] = [...(options.exclude || [])];
+  let javaRoots: string[] = [];
   try {
     const config = JSON.parse(
       await fs.readFile(path.join(base, ".nativue/config.json"), "utf8"),
     );
+    if (config.java?.enabled && Array.isArray(config.java.roots))
+      javaRoots = [config.java, ...(Array.isArray(config.java.scopes) ? config.java.scopes : [])]
+        .flatMap(scope => Array.isArray(scope.roots) ? scope.roots : []).filter((p: unknown) => typeof p === "string");
     if (Array.isArray(config.exclude))
       extra.push(
         ...config.exclude.filter((p: unknown) => typeof p === "string"),
@@ -228,7 +232,10 @@ export async function scanWorkspace(
         !p.split("/").includes("..") &&
         allowed(p, extra),
     )
-    .sort();
+    .sort((a,b) => {
+      const selected = (file: string) => javaRoots.some(r=>file === r || file.startsWith(r.replace(/\/$/, "") + "/"));
+      return Number(selected(b)) - Number(selected(a)) || (a < b ? -1 : a > b ? 1 : 0);
+    });
   if (candidates.length > 5000)
     warnings.push("Scan limited to 5000 files. / 扫描限制为 5000 个文件。");
   const files: FileEntry[] = [];

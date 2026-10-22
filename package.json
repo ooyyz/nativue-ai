@@ -5,6 +5,10 @@
   "type": "module",
   "license": "MIT",
   "author": "SienGe AI Lab",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ooyyz/nativue-ai.git"
+  },
   "engines": {
     "node": ">=24"
   },
@@ -30,12 +34,16 @@
     "check": "npm run build && npm test",
     "docs:screenshots": "npm run build && node scripts/generate-readme-screenshots.ts",
     "pack:check": "npm pack --dry-run",
-    "test:browser": "node test/browser.smoke.ts"
+    "test:browser": "node test/browser.smoke.ts",
+    "test:java-browser": "node test/java.browser.ts"
   },
   "devDependencies": {
+    "@playwright/test": "^1.56.0",
     "@types/node": "^24.0.0",
-    "typescript": "^5.9.0",
     "esbuild": "^0.25.0",
-    "@playwright/test": "^1.56.0"
+    "typescript": "^5.9.0"
+  },
+  "dependencies": {
+    "java-parser": "3.0.1"
   }
 }

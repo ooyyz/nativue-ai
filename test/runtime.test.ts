@@ -194,6 +194,22 @@ test("local HTTP validates host/origin, requires mutation token and confines fil
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+test("server shutdown stops refresh writes to open event streams", async () => {
+  const root = fixture();
+  const app = await serve(root, 0);
+  const events = await fetch(app.url + "/api/events");
+  const reader = events.body!.getReader();
+  try {
+    await reader.read();
+    await app.close();
+    app.runtime.emit();
+    await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    await reader.cancel();
+    await app.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 test("semantic import rejects evidence beyond the actual source line count", async () => {
   const root = fixture();
   try {

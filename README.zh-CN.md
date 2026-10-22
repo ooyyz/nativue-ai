@@ -4,6 +4,8 @@
 
 [English](README.md) · 简体中文
 
+开发仓库：[ooyyz/nativue-ai](https://github.com/ooyyz/nativue-ai)。
+
 **给非代码背景的 vibe coder，一张掌控复杂软件开发的工作画布。**
 
 当你用 AI 开发一个架构复杂、面向生产的软件项目，功能越来越多，模块相互牵连，多个 Agent 同时工作，难题也会从“让它写出来”变成：**我怎么掌握全局，确认它没改偏，还能高效推进？**
@@ -57,6 +59,8 @@ node bin/nativue.js serve /path/to/workspace
 
 ![Orbit Desk mock 的中文架构图：15 个模块及其关联关系](assets/demo-architecture.zh.png)
 
+有子模块的卡片可点击进入内部架构图，通过顶部面包屑或“返回上层”回到主架构；各层保留独立的布局与缩放位置。内部模块和关系由带源码证据的分析提供。
+
 ### 2. 用户旅程：沿一次真实操作检查经过哪些模块
 
 选择“创建并发布文档”等旅程后，画布高亮相关模块，右侧按顺序列出每一步。推断出的流程会明确标记，不能替代独立运行验收。
@@ -103,6 +107,16 @@ node bin/nativue.js serve /path/to/workspace
 | WorkBuddy | 通用 Skill、手动 A/B/C 流程 | 未验证接口前不宣称支持 | 尚无记录 |
 
 “已提供”表示仓库包含对应指令及接入路径，不表示已在三个产品里全部运行通过。真实 Codex CLI 已对虚构的双文件 TypeScript 仓库完成后台分析；宿主内手动 A/B/C 与自动子 Agent 交付仍未验证。本地测试和宿主验证分别记录。[Claude Code 官方支持 Skills](https://code.claude.com/docs/en/skills)，[WorkBuddy 官方支持 Skill 插件](https://www.workbuddy.cn/docs/workbuddy/Plugins)；这不代表 Nativue 自动调度已完成实测。详见[接入说明、实测版本与能力边界](docs/compatibility.md)。
+
+## Java 源码自动建图
+
+运行 `node bin/nativue.js configure-java /path/to/workspace --scope src` 启用本地解析；加 `--parent moduleId` 挂到已有主模块。`--config rules.json` 支持 `enabled`、`roots`、可选 `parentId` 和功能入口规则（`id`、`name`、`seeds`）。规则只定义功能入口，类、方法和关系自动提取；省略规则时按源码声明与关系推导候选功能。
+
+可从功能进入类、方法和两跳调用链。继承、实现、注解注入、构造参数依赖及方法调用保留源码位置；歧义或缺失目标列为诊断。文件监听复用未变化的语法事实，自动更新关系并展示新增、变化和删除项，各层布局跨刷新保存。静态声明目标不代表运行时派发。详见[范围、解析规则与限制](docs/java-architecture.md)。
+
+类、方法前的 Javadoc、块注释和连续行注释会自动填充职责说明，并保留注释行号。没有功能规则时，短注释摘要用于推断功能名称；类或方法可选的 `@feature 名称`、`功能：名称` 标记能提供更明确的归属。点击“它负责什么”旁的“编辑”保存手动说明，重新分析和重启后仍保留；“恢复自动内容”切回最新源码说明。修改单独保存在工作区忽略目录 `.nativue/descriptions.json`，本地与远端版本分别保存。
+
+功能详情支持“重命名”，类详情支持“调整归属”，可移动到同一架构下的其他功能。类的方法一并移动，当前层级的连线随新归属展示。名称与归属独立保存在 `.nativue/architecture-edits.json`，重新分析后保留，并可分别“恢复自动识别”。目标功能在源码中消失时，保留原设置并提示暂用自动归属；目标重新出现后恢复应用。
 
 ## 自动更新
 

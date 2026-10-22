@@ -7,6 +7,7 @@ import { defaultConfig, saveConfig, readSnapshot } from "../src/store.ts";
 import { Runtime } from "../src/runtime.ts";
 import { importAnalysis } from "../src/analysis.ts";
 import { serve } from "../src/server.ts";
+import type { Module } from "../src/types.ts";
 const temp = fs.mkdtempSync(path.join(os.tmpdir(), "nativue-browser-"));
 const root = path.join(temp, "atlas-notes");
 fs.mkdirSync(root);
@@ -27,7 +28,7 @@ for (const [name, content] of Object.entries(files)) {
 saveConfig(root, defaultConfig());
 await new Runtime(root).scan(true);
 const s = readSnapshot(root)!;
-const groups = [
+const groups: Module[] = [
   {
     id: "editor",
     name: "Note editor",
@@ -59,11 +60,23 @@ const groups = [
     confidence: "observed" as const,
   },
 ];
+groups.push(...[
+  { id: "platform", name: "Note platform" },
+  { id: "note-router", name: "Note router", parentId: "platform" },
+  { id: "note-store", name: "Note store", parentId: "platform" },
+  { id: "note-cache", name: "Note cache", parentId: "note-store" },
+].map((m): Module => ({ ...m, description: "Fictional note subsystem.",
+  kind: "backend", files: ["shared/note.ts"],
+  evidence: [{ path: "shared/note.ts", line: 1 }], confidence: "observed" })));
 await importAnalysis(root, {
   schemaVersion: 1,
   inputId: s.id,
   modules: groups,
   edges: [
+    { id: "route-store", from: "note-router", to: "note-store", label: "store note",
+      evidence: [{ path: "shared/note.ts", line: 1 }], confidence: "observed" },
+    { id: "router-api", from: "note-router", to: "api", label: "external API",
+      evidence: [{ path: "shared/note.ts", line: 1 }], confidence: "inferred" },
     {
       id: "save-call",
       from: "editor",
@@ -152,8 +165,53 @@ try {
   await instance.runtime.scan(true);
   await page.waitForTimeout(300);
   assert.equal(await page.locator('#world').evaluate(el=>(el as HTMLElement).style.transform),zoomed);
+  // Children stay out of the main map; pointer and keyboard clicks both drill down.
+  assert.equal(await page.locator('[data-node]').count(), 4);
+  assert.equal(await page.locator('[data-node="note-router"]').count(), 0);
+  assert.equal(await page.locator('.edge').count(), 1);
+  await page.locator('[data-node="platform"]').click();
+  await page.locator('#map-breadcrumbs [aria-current="page"]').filter({hasText:'Note platform'}).waitFor();
+  assert.equal(await page.locator('[data-node]').count(), 2);
+  assert.equal(await page.locator('[data-node="editor"]').count(), 0);
+  assert.equal(await page.locator('.edge').count(), 1);
+  await page.locator('#zoom-in').click();
+  const internalView = await page.locator('#world').evaluate(el=>(el as HTMLElement).style.transform);
+  await page.locator('[data-node="note-router"]').click();
+  await page.locator('#selection').getByRole('heading', {name:'Note router', exact:true}).waitFor();
+  await page.locator('#show-selected-files').click();
+  assert.equal(await page.locator('#tab-folders').getAttribute('aria-selected'), 'true');
+  await page.locator('#tab-updates').click();
+  await page.locator('[data-node="note-store"]').focus();
+  await page.keyboard.press('Enter');
+  await page.locator('[data-node="note-cache"]').waitFor();
+  assert.equal(await page.locator('[data-node]').count(), 1);
+  assert.equal(await page.locator('#map-breadcrumbs li').count(), 3);
+  await page.locator('[data-map-scope="platform"]').click();
+  assert.equal(await page.locator('#world').evaluate(el=>(el as HTMLElement).style.transform), internalView);
+  await instance.runtime.scan(true);
+  await page.locator('#language-button').click();
+  await page.getByRole('button', {name:'← Back', exact:true}).waitFor();
+  assert.equal(await page.locator('[data-node]').count(), 2);
+  await page.screenshot({path:'artifacts/drilldown-en.png',fullPage:true});
+  await page.locator('#map-up').click();
+  assert.equal(await page.locator('[data-node]').count(), 4);
+  assert.equal(await page.locator('#world').evaluate(el=>(el as HTMLElement).style.transform), zoomed);
+  await page.locator('[data-node="platform"]').click();
+  await page.locator('#language-button').click();
+  await page.getByRole('button', {name:'← 返回上层', exact:true}).waitFor();
+  await page.screenshot({path:'artifacts/drilldown-zh.png',fullPage:true});
+  await page.locator('[data-map-scope=""]').click();
+  assert.equal(await page.locator('[data-node]').count(), 4);
+  // An analysis refresh removing the open parent returns to a reachable main map.
+  await page.locator('[data-node="platform"]').click();
+  await importAnalysis(root, {schemaVersion: 1, inputId: readSnapshot(root)!.id,
+    modules: groups.filter(m=>!['platform','note-router','note-store','note-cache'].includes(m.id)),
+    edges: [], journeys: []});
+  instance.runtime.emit();
+  await page.locator('#map-up').waitFor({state:'detached'});
+  assert.equal(await page.locator('[data-node]').count(), 3);
   assert.deepEqual(failures,[]);
-  console.log('Browser smoke passed: original canvas/sidebar, journeys, parallel dependency groups, task creation, bilingual UI, exact file auto-scroll/focus, viewport retention.');
+  console.log('Browser smoke passed: original canvas/sidebar, journeys, parallel dependency groups, task creation, bilingual UI, exact file auto-scroll/focus, viewport retention, nested drill-down, bilingual breadcrumbs, parent removal and return viewport restoration.');
 } finally {
   await browser.close();
   instance.close();

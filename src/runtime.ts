@@ -13,6 +13,7 @@ import {
 } from "./store.ts";
 import { analysisRequest, runAnalysis } from "./analysis.ts";
 import { claimAnalysis, readBudget } from "./analysis-lock.ts";
+import { refreshJavaGraph, javaConfigId } from "./java/graph.ts";
 export class Runtime {
   root: string;
   state: RuntimeState;
@@ -72,7 +73,8 @@ export class Runtime {
         scanned = await scanWorkspace(this.root);
       if (this.closed) return;
       this.state.lastScan = new Date().toISOString();
-      if (previous?.id === scanned.id) return previous;
+      const config = readConfig(this.root);
+      if (previous?.id === scanned.id && (!config.java?.enabled || previous.java?.configId === javaConfigId(config.java))) return previous;
       const old = new Map(previous?.files.map((f) => [f.path, f.hash]));
       this.state.changedFiles = [
         ...scanned.files
@@ -97,6 +99,9 @@ export class Runtime {
           .filter((m) => m.files.length && m.evidence.length);
         const ids = new Set(modules.map((m) => m.id)),
           assigned = new Set(modules.flatMap((m) => m.files));
+        // Keep surviving children reachable if a removed parent loses all evidence.
+        for (const m of modules)
+          if (m.parentId && !ids.has(m.parentId)) delete m.parentId;
         next = {
           ...scanned,
           modules: [
@@ -129,6 +134,9 @@ export class Runtime {
           },
         };
       }
+      if (config.java?.enabled)
+        next = refreshJavaGraph(this.root, next, config.java, previous || undefined, config.language);
+      if (this.closed) return;
       saveSnapshot(this.root, next);
       analysisRequest(this.root, next, this.state.changedFiles);
       this.state.error = undefined;
