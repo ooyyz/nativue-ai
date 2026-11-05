@@ -36,7 +36,7 @@ Use the exact request `inputId`, schema version 1, and these three arrays:
 
 The example is illustrative; never submit its paths or IDs without matching source files. The maintained TypeScript types are `Module`, `Edge`, `Journey`, and `Evidence` in the Nativue source. Optional module `x` and `y` coordinates may be preserved from the previous graph.
 
-- **Module:** `id`, `name`, `description`, `kind`, `files`, `evidence`, `confidence`.
+- **Module:** `id`, optional `parentId`, `name`, `description`, `kind`, `files`, `evidence`, `confidence`.
 - **Edge:** `id`, `from`, `to`, `label`, `evidence`, `confidence`. Both endpoints must identify response modules.
 - **Journey:** `id`, `name`, `description`, `steps`, `confidence`. Each step has `moduleId`, `label`, and `evidence`; referenced modules must exist.
 - **Evidence:** workspace-relative `path`, optional 1-based `line`, optional `note`. Paths must belong to the indexed packet, and cited lines must exist.
@@ -44,8 +44,14 @@ The example is illustrative; never submit its paths or IDs without matching sour
 
 ## Evidence decisions
 
+Use `parentId` to place a module inside another module's drill-down view. Omit it for top-level modules. Parents must exist in the same response and cycles are rejected. A module with children opens its internal graph when clicked; breadcrumbs return to its ancestors. Keep internal edges between child modules and source evidence for each child. Preserve existing hierarchy during incremental analysis. Existing flat graphs remain valid.
+
 Use `observed` for a directly inspected declaration, import, or call. Use `inferred` when source supports a plausible explanation but behavior is unconfirmed. Reserve `verified` for behavior checked against adequate direct evidence, such as an exercised route or existing test with reviewed results. Do not call a directory grouping verified, invent data flow from filenames, or equate imports with runtime communication.
 
 Keep IDs stable where the concept is unchanged. Update affected relationships and preserve unrelated validated context. Review call sites when a file is deleted or renamed. Distinguish browser, server, storage and external services only when source establishes those roles. A user journey requires source-backed transitions; keep missing links explicit and avoid inventing product completeness.
 
 The importer rejects stale `inputId`, invalid evidence and dangling references. A rejected or failed response leaves the last valid graph in place. Rescan and regenerate against current input; do not replace the ID in an old response to bypass the stale check. Report pending or unverified analysis visibly.
+
+## Automatic Java graph ownership
+
+`configure-java` enables local syntax analysis independently of an AI command runner. Optional source scopes and feature-entry seeds belong in workspace-local configuration. Generated `generator: "java"` nodes and edges remain owned by the parser; semantic imports preserve them. Use `Snapshot.java` diagnostics and changes to distinguish resolved declarations, inferred feature ownership, ambiguous calls and failed refreshes. Automatic Java analysis does not imply that other-language or manual architecture semantics are current.

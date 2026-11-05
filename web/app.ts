@@ -1,3 +1,4 @@
+import { codeHierarchy, type CodeHierarchy } from "./code-hierarchy.ts";
 import type {
   DashboardState,
   Snapshot,
@@ -28,6 +29,18 @@ let selectedModule = "",
   search = "",
   related: string[] = [],
   relatedOnly = false;
+let mapParent = "", callRoot = "", layoutKey = "", mapQuery = "";
+let canvasGestureActive = false, canvasRenderPending = false;
+interface MapLocation {
+  arrangeRevision?: string;
+  view: typeof view;
+  selectedModule: string;
+  nodes: typeof nodePositions;
+  groups: typeof groupPositions;
+  collapsed: Set<string>;
+  query?: string;
+}
+const mapLocations = new Map<string, MapLocation>();
 let modal = "",
   modalCleanup: (() => void) | undefined,
   busy = false,
@@ -41,7 +54,7 @@ const text = (en: string, zh: string) => (lang === "zh" ? zh : en);
 const collapsed = new Set<string>(),
   opened = new Set<string>(),
   nodePositions = new Map<string, { x: number; y: number }>(),
-  groupPositions = new Map<string, { x: number; y: number }>();
+  groupPositions = new Map<string, { x: number; y: number; columns?: number }>();
 let view = { x: 0, y: 0, scale: 1 },
   boardView = { x: 0, y: 0, scale: 1 },
   stageSize = { width: 900, height: 700 };
@@ -61,6 +74,90 @@ const statusLabel = (s: string) => (labels[s] ? text(...labels[s]) : s);
 const snapshot = (): Snapshot | null =>
   data ? (source === "remote" ? data.remote : data.local) : null;
 const moduleById = (id: string) => snapshot()?.modules.find((m) => m.id === id);
+const childModules = (id: string) =>
+  snapshot()?.modules.filter((m) => (m.parentId || "") === id) || [];
+function callChainModules() {
+  const ids = new Set([callRoot]), queue = [{id: callRoot, depth: 0}];
+  const calls = snapshot()?.edges.filter(e => e.relation === "calls") || [];
+  for (let i = 0; i < queue.length; i++) {
+    const {id, depth} = queue[i];
+    if (depth >= 2) continue;
+    for (const e of calls) {
+      const next = e.from === id ? e.to : e.to === id ? e.from : "";
+      if (next && !ids.has(next) && ids.size < 80) { ids.add(next); queue.push({id: next, depth: depth + 1}); }
+    }
+  }
+  return snapshot()?.modules.filter(m => ids.has(m.id)) || [];
+}
+const visibleMapModules = () => (callRoot ? callChainModules() : childModules(mapParent)).filter(m => !mapQuery || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(mapQuery.toLowerCase()));
+const scopeKey = () => mapParent + (callRoot ? "#calls:" + callRoot : "");
+function rememberMap() {
+  mapLocations.set(scopeKey(), { view: {...view}, selectedModule,
+    arrangeRevision: mapLocations.get(scopeKey())?.arrangeRevision,
+    nodes: new Map(nodePositions), groups: new Map(groupPositions), collapsed: new Set(collapsed), query: mapQuery });
+  if (!layoutKey) return;
+  try { localStorage.setItem(layoutKey, JSON.stringify({parent: mapParent, callRoot, locations: [...mapLocations].map(([id,l]) => [id,{...l,nodes:[...l.nodes],groups:[...l.groups],collapsed:[...l.collapsed]}])})); } catch {}
+}
+function restoreMap() {
+  const key = `nativue-layout:${data?.workspaceId || workspaceTitle()}:${source}`;
+  if (layoutKey === key) return;
+  layoutKey = key;
+  mapLocations.clear();
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "null");
+    if (!saved) return;
+    for (const [id,l] of saved.locations) {
+      if (!l.view || ![l.view.x,l.view.y,l.view.scale].every(Number.isFinite)) continue;
+      mapLocations.set(id, {...l,nodes:new Map(l.nodes),groups:new Map(l.groups),collapsed:new Set(l.collapsed)});
+    }
+    mapParent = moduleById(saved.parent) ? saved.parent : "";
+    callRoot = moduleById(saved.callRoot) ? saved.callRoot : "";
+    const location = mapLocations.get(scopeKey());
+    if (location) {
+      nodePositions.clear(); groupPositions.clear(); collapsed.clear();
+      for (const [id,p] of location.nodes) nodePositions.set(id,p);
+      for (const [id,p] of location.groups) groupPositions.set(id,p);
+      for (const id of location.collapsed) collapsed.add(id);
+      view = {...location.view}; selectedModule = location.selectedModule; mapQuery = location.query || ""; initialFit = true;
+    }
+  } catch { mapLocations.clear(); }
+}
+function moduleTrail(id: string): Module[] {
+  const trail: Module[] = [], seen = new Set<string>();
+  let m = moduleById(id);
+  while (m && !seen.has(m.id)) {
+    trail.unshift(m);
+    seen.add(m.id);
+    m = moduleById(m.parentId || "");
+  }
+  return trail;
+}
+function navigateMap(parent: string, calls = "") {
+  if (parent === mapParent && calls === callRoot) return;
+  rememberMap();
+  mapParent = parent;
+  callRoot = calls;
+  const saved = mapLocations.get(scopeKey());
+  nodePositions.clear();
+  groupPositions.clear();
+  collapsed.clear();
+  for (const [id, p] of saved?.nodes || []) nodePositions.set(id, p);
+  for (const [id, p] of saved?.groups || []) groupPositions.set(id, p);
+  for (const id of saved?.collapsed || []) collapsed.add(id);
+  view = saved ? { ...saved.view } : { x: 0, y: 0, scale: 1 };
+  selectedModule = saved?.selectedModule || calls || parent;
+  mapQuery = saved?.query || "";
+  selectedTask = "";
+  journeyStep = -1;
+  tab = "updates";
+  initialFit = Boolean(saved);
+  render();
+  requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+}
+function renderMapNavigation() {
+  const trail = moduleTrail(mapParent);
+  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "架构层级")}">${(mapParent || callRoot) ? `<button id="map-up">← ${text("Back", "返回上层")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "主架构")}</button>` : `<span aria-current="page">${text("Main architecture", "主架构")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain · 2 hops · max 80", "调用链 · 两跳 · 最多 80 个节点")}</span></li>` : ""}</ol><span class="map-scope-count">${visibleMapModules().length} ${text("modules", "个模块")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "查找类或方法")}" placeholder="${text("Find a class or method", "查找类或方法")}" value="${esc(mapQuery)}">` : ""}</nav>`;
+}
 const formatDate = (v?: string) =>
   v
     ? new Date(v).toLocaleString(lang === "zh" ? "zh-CN" : "en-US", {
@@ -100,12 +197,18 @@ async function api(path: string, body?: unknown) {
 }
 async function refresh() {
   try {
-    data = (await api("/api/state")) as DashboardState;
+    const next = (await api("/api/state")) as DashboardState;
+    if (canvasGestureActive) { canvasRenderPending = true; return; }
+    data = next;
     if (!lang) {
       lang = data.config.language;
       localStorage.setItem("nativue-language", lang);
     }
     const s = snapshot();
+    restoreMap();
+    if (mapParent && !moduleById(mapParent)) navigateMap("");
+    if (callRoot && !moduleById(callRoot)) navigateMap(mapParent);
+    if (selectedModule && !moduleById(selectedModule)) selectedModule = "";
     if (selectedFile && !s?.files.some((f) => f.path === selectedFile))
       selectedFile = "";
     related = related.filter((p) => s?.files.some((f) => f.path === p));
@@ -164,12 +267,15 @@ function runtimeLabel() {
 interface Group {
   id: string;
   title: string;
+  description?: string;
   modules: Module[];
   color: string[];
   x: number;
   y: number;
   width: number;
   height: number;
+  columns: number;
+  hierarchy?: CodeHierarchy;
 }
 const palettes = [
   ["#edf3fa", "#e0eaf6", "#b6cbe0"],
@@ -179,6 +285,8 @@ const palettes = [
   ["#eaf4f4", "#dbecec", "#b7d2d2"],
 ];
 function groupTitle(kind: string) {
+  const custom = data?.config.moduleGroups?.find(g => g.id === kind);
+  if (custom) return custom.name;
   const titles: Record<string, [string, string]> = {
     frontend: ["Frontend", "前端"],
     backend: ["Backend", "后端"],
@@ -193,37 +301,81 @@ function groupTitle(kind: string) {
   };
   return titles[kind] ? text(...titles[kind]) : kind || text("Modules", "模块");
 }
+const hierarchyCache = new WeakMap<Snapshot, Map<string, CodeHierarchy>>();
+function hierarchyFor(modules: Module[], columns: number) {
+  const s = snapshot();
+  if (!s || !modules.length || !modules.every(m => m.generator === "java" && m.level === "class")) return undefined;
+  let cache = hierarchyCache.get(s);
+  if (!cache) hierarchyCache.set(s, cache = new Map());
+  const key = JSON.stringify([columns, modules.map(m => m.id)]);
+  if (!cache.has(key)) cache.set(key, codeHierarchy(modules, s.edges, columns));
+  return cache.get(key);
+}
 function groups(): Group[] {
   const map = new Map<string, Module[]>();
-  for (const m of snapshot()?.modules || []) {
+  for (const m of visibleMapModules()) {
     const k = m.kind || "source";
     if (!map.has(k)) map.set(k, []);
     map.get(k)!.push(m);
   }
-  return [...map].map(([id, modules], i) => {
-    const p = groupPositions.get(id) || { x: 60 + i * 420, y: 70 };
-    return {
+  const entries = [...map];
+  const descriptions = new Map(data?.config.moduleGroups?.map(g => [g.id, g.description]));
+  const columns = mapParent
+    ? Math.max(1, Math.min(entries.length, Math.round(Math.sqrt(entries.length * stageSize.width / stageSize.height))))
+    : Math.max(1, entries.length);
+  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns || (mapParent ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3)))) : 1));
+  const hierarchies = entries.map(([, modules], i) => hierarchyFor(modules, nodeColumns[i]));
+  const result: Group[] = [];
+  for (const [i, [id, modules]] of entries.entries()) {
+    let y = 70;
+    for (let row = 0; row < Math.floor(i / columns); row++)
+      y += Math.max(...result.slice(row * columns, (row + 1) * columns).map(g=>g.height)) + 55;
+    const rowStart = Math.floor(i / columns) * columns;
+    const x = 60 + result.slice(rowStart, i).reduce((sum,g)=>sum+g.width+52,0);
+    const p = groupPositions.get(id) || { x, y, columns: nodeColumns[i] };
+    // Saved node coordinates are absolute. Resolve the group's actual origin
+    // before measuring its content, including legacy layouts without group positions.
+    const positions = modules.flatMap(m => {
+      const saved = nodePositions.get(m.id);
+      return saved ? [{x:saved.x-p.x, y:saved.y-p.y}] : [];
+    });
+    const height = collapsed.has(id) ? 108 + (descriptions.get(id) ? 40 : 0) :
+      Math.max(285, 130 + (descriptions.get(id) ? 40 : 0) +
+        (hierarchies[i]?.height ?? Math.ceil(modules.length / nodeColumns[i]) * 164),
+        ...positions.map(pos=>pos.y+164));
+    const width = Math.max(hierarchies[i] ? hierarchies[i]!.width + 50 : 368+(nodeColumns[i]-1)*350,
+      ...positions.map(pos=>pos.x+341));
+    if (mapParent) groupPositions.set(id, p);
+    result.push({
       id,
       title: groupTitle(id),
-      modules,
+      description: descriptions.get(id),
+      modules: hierarchies[i] ? hierarchies[i]!.families.flatMap(f => f.members.map(id => modules.find(m => m.id === id)!)) : modules,
       color: palettes[i % palettes.length],
       ...p,
-      width: 368,
-      height: collapsed.has(id)
-        ? 108
-        : Math.max(285, 130 + modules.length * 164),
-    };
-  });
+      columns: nodeColumns[i],
+      width,
+      height,
+      hierarchy: hierarchies[i],
+    });
+  }
+  return result;
 }
 function nodePos(m: Module, g?: Group) {
   g = g || groups().find((gr) => gr.modules.some((n) => n.id === m.id));
   const i = g?.modules.findIndex((n) => n.id === m.id) || 0;
-  return (
+  const planned = g?.hierarchy?.positions.get(m.id);
+  const position = (
     nodePositions.get(m.id) || {
-      x: (g?.x || 0) + 25 + (m.x || 0),
-      y: (g?.y || 0) + 115 + i * 164 + (m.y || 0),
+      x: (g?.x || 0) + 25 + (planned?.x ?? (i % (g?.columns || 1)) * 350) + (m.x || 0),
+      y: (g?.y || 0) + 115 + (g?.description ? 40 : 0) + (planned?.y ?? Math.floor(i / (g?.columns || 1)) * 164) + (m.y || 0),
     }
   );
+  if (mapParent && !nodePositions.has(m.id)) {
+    while ([...nodePositions.values()].some(p=>p.x===position.x&&p.y===position.y)) position.y += 164;
+    nodePositions.set(m.id, position);
+  }
+  return position;
 }
 function activeModules() {
   if (selectedTask) {
@@ -239,16 +391,29 @@ function activeModules() {
     return new Set(
       journeyStep >= 0 && j?.steps[journeyStep]
         ? [j.steps[journeyStep].moduleId]
-        : j?.steps.map((st) => st.moduleId) || [],
+        : j?.steps.map((st) =>
+            moduleTrail(st.moduleId).find((m) => (m.parentId || "") === mapParent)?.id || st.moduleId,
+          ) || [],
     );
   }
-  return new Set(selectedModule ? [selectedModule] : []);
+  const family = groups().flatMap(g => g.hierarchy?.families || []).find(f => f.members.includes(selectedModule));
+  return new Set(family?.members || (selectedModule && selectedModule !== mapParent ? [selectedModule] : []));
 }
 function render() {
+  if (canvasGestureActive) { canvasRenderPending = true; return; }
   if (!data) return;
+  const arrangeRevision = data.layoutRequests?.[source]?.[scopeKey()];
+  if (typeof arrangeRevision === "string" && arrangeRevision &&
+      mapLocations.get(scopeKey())?.arrangeRevision !== arrangeRevision) {
+    nodePositions.clear(); groupPositions.clear(); collapsed.clear(); mapQuery = "";
+    view = {x:0, y:0, scale:1}; initialFit = false;
+    mapLocations.set(scopeKey(), {arrangeRevision, view:{...view}, selectedModule,
+      nodes:new Map(), groups:new Map(), collapsed:new Set()});
+  }
   const savedScroll = document.querySelector(".sidebar-scroll")?.scrollTop,
     inspectorScroll = document.querySelector(".parallel-inspector")?.scrollTop;
   const active = document.activeElement as HTMLElement | null;
+  const focusModuleSearch = active?.id === "module-search";
   const focusSearch = active?.id === "file-search",
     caret = focusSearch
       ? (active as HTMLInputElement).selectionStart
@@ -257,7 +422,7 @@ function render() {
   const s = snapshot(),
     r = data.runtime;
   document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
-  document.title = `Nativue AI · ${workspaceTitle()}`;
+  document.title = `Tika's Code · ${workspaceTitle()}`;
   app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "开发画布")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "说明与导航")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "调整右侧宽度")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "代码与运行地图")}</h1><select id="version-picker" aria-label="${text("View version", "查看版本")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "当前工作区")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "远端分支")}${data.config.remote.branch ? " · " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "画布视图")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "并行开发")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "代码地图")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "更新源码索引")}" ${busy ? "disabled" : ""}>↻</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "设置")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "切换到英文")}">${lang === "zh" ? "EN" : "中文"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "并行开发")}</h2><p class="empty-text">${text("Tasks are grouped by dependency depth, not by status. Click a card for scope, ownership, commits and independent review evidence.", "任务按依赖层级分组，不按状态分列。点击卡片查看范围、认领、提交和独立验收证据。")}</p><button class="primary" id="new-task">＋ ${text("New task", "新建任务")}</button>${renderTaskDetail(undefined)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "架构辅助导航")}">${(["updates", "journeys", "folders"] as const).map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "本次更新"), text("Journeys", "操作旅程"), text("Folders", "文件夹")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "颜色、连线和验证边界")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "大模块底色区分类别。实线表示有观察或核对依据的源码关系，点线表示推断。源码分析不等于运行验收。")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "拖动卡片或组标题；拖动空白平移，滚轮缩放。方向键移动，加减键缩放，0 回到全图。")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "版本与使用说明")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "工作区")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "今日 AI 调用")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "分析")}</button><button id="pause-button">${r.paused ? text("Resume", "恢复") : text("Pause", "暂停")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "同步远端")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI · ${esc(short(s?.source.commit))}${s?.source.dirty ? " · " + text("modified", "有修改") : ""}</span><button class="subtle" id="help-button">${text("Help", "使用帮助")}</button></div><span class="attribution">SienGe AI Lab · 小红书：SienGe的AI实验室</span></footer></aside></main>`;
   bind();
   bindResize();
@@ -270,6 +435,7 @@ function render() {
     const el = document.querySelector(".parallel-inspector");
     if (el) el.scrollTop = inspectorScroll;
   }
+  if (focusModuleSearch) { const input = document.querySelector<HTMLInputElement>("#module-search"); input?.focus(); }
   if (focusSearch) {
     const el = document.querySelector<HTMLInputElement>("#file-search");
     el?.focus();
@@ -304,26 +470,90 @@ function renderNotice() {
     out += `<div class="notice error">${esc(s.analysis.error)}</div>`;
   if (s && s.analysis.status !== "complete")
     out += `<div class="notice">${s.analysis.status === "stale" ? text("Code changed. Showing the last architecture while an update is queued.", "代码已变化，当前保留上一版架构，等待增量分析。") : text("Source indexed. Architecture explanations are waiting for an Agent.", "源码已索引，架构说明等待 Agent 分析。")}<br><button id="notice-analyze">${text("Analyze / create request", "分析 / 生成请求")}</button></div>`;
-  return out;
+  return out + renderJavaStatus();
 }
 function renderVersion() {
   const s = snapshot();
   return `<p class="source-version">${text("Source", "来源")}: ${s?.source.kind === "remote" ? text("Remote", "远端") : text("Local", "本地")} · ${esc(s?.source.branch || "—")}<br>${text("Commit", "提交")}: ${esc(s?.source.commit || "—")}<br>${text("Snapshot", "快照")}: ${esc(s?.id || "—")}<br>${text("Indexed", "索引更新")}: ${formatDate(s?.generatedAt)}<br>${text("Semantic update", "语义更新")}: ${formatDate(s?.analysis.updatedAt)}</p>`;
 }
+function renderJavaStatus() {
+  const j = snapshot()?.java;
+  if (!j) return "";
+  const c = j.changes;
+  return `<details class="java-report" ${j.status === "failed" ? "open" : ""}><summary>${text("Java automatic source graph", "Java 源码自动建图")} · ${j.status === "failed" ? text("Failed · previous graph retained", "失败 · 保留上一有效图") : text("Updated", "已更新")}</summary><p>${text("Parsed / cached / re-resolved files", "解析 / 缓存复用 / 关系重算文件")}: ${j.parsedFiles} / ${j.reusedFiles} / ${j.resolvedFiles}</p><p>${text("Added / changed / removed nodes", "新增 / 变化 / 删除节点")}: ${c.added.length} / ${c.changed.length} / ${c.removed.length}<br>${text("Added / changed / removed relationships", "新增 / 变化 / 删除关系")}: ${c.addedEdges.length} / ${c.changedEdges.length} / ${c.removedEdges.length}</p>${c.removed.slice(0,20).map(m=>`<p class="removed-item">− ${esc(m.name)}</p>`).join("")}${c.removedEdges.slice(0,20).map(e=>`<p class="removed-item">− ${esc(e.relation)}: ${esc(e.label)}</p>`).join("")}<p>${text("Unresolved / ambiguous / parser diagnostics", "未解析 / 歧义 / 语法诊断")}: ${j.diagnosticCount}</p><div class="java-diagnostics">${j.diagnostics.slice(0,25).map(d=>`<p><code>${esc(d.path)}:${d.line}</code><br>${esc(d.kind)} · ${esc(d.message)}</p>`).join("")}</div><p>${text("Feature membership is inferred. Relationships describe declared source targets; reflection, complex call chains and runtime binding remain unresolved.", "功能归属是推断。连线表示源码声明目标；反射、复杂链式表达式和运行时绑定仍有解析边界。")}</p></details>`;
+}
+function mapEdges() {
+  const visible = new Set(visibleMapModules().map(m=>m.id));
+  const lift = (id: string) => callRoot ? visible.has(id) ? id : undefined :
+    moduleTrail(id).find(m=>(m.parentId || "") === mapParent)?.id;
+  const projected = new Map<string, {edge: NonNullable<Snapshot>["edges"][number]; count: number}>();
+  const result: Snapshot["edges"] = [];
+  for (const e of snapshot()?.edges || []) {
+    if (e.generator !== "java") { if (!callRoot) result.push(e); continue; }
+    if (callRoot && e.relation !== "calls") continue;
+    const from = lift(e.from), to = lift(e.to);
+    if (!from || !to || from === to) continue;
+    const key = `${from}:${to}:${e.relation}`;
+    const existing = projected.get(key);
+    if (existing) {
+      existing.count++;
+      existing.edge.evidence = [...existing.edge.evidence,...e.evidence].slice(0,8);
+      if (e.confidence === "inferred") existing.edge.confidence = "inferred";
+      if (e.change) existing.edge.change = e.change;
+    } else projected.set(key, {edge:{...e,from,to},count:1});
+  }
+  return [...result,...[...projected.values()].map(({edge,count})=>({...edge,label:edge.label+(count > 1 ? ` · ${count} ${text("source relationships", "条源码关系")}` : "")}))];
+}
+function typeName(m: Module) {
+  const names: Record<string, [string, string]> = {class: ["Class", "类"], interface: ["Interface", "接口"], enum: ["Enum", "枚举"], record: ["Record", "记录类"]};
+  return text(...(names[m.typeKind || "class"] || names.class));
+}
+function typeRelations(m: Module) {
+  const relations: {target: Module; label: string}[] = [];
+  const owner = moduleById(m.declaringTypeId || "");
+  if (owner) relations.push({target: owner, label: text("Declared in", "内部类型，属于")});
+  for (const edge of snapshot()?.edges || []) {
+    if (edge.from !== m.id || !["implements", "extends"].includes(edge.relation || "")) continue;
+    const target = moduleById(edge.to);
+    if (target) relations.push({target, label: edge.relation === "implements" ? text("Implements", "实现") : text("Extends", "继承")});
+  }
+  return relations;
+}
+function renderTypeBadge(m: Module) {
+  if (m.level !== "class" || m.generator !== "java") return "";
+  const relations = typeRelations(m).map(r => r.label + " " + r.target.name).join(" · ");
+  return `<span class="type-relation" title="${esc(relations || m.symbol)}"><strong>${typeName(m)}</strong>${relations ? ` · ${esc(relations)}` : ""}</span>`;
+}
+function renderTypeFamilies(g: Group) {
+  if (!g.hierarchy || collapsed.has(g.id)) return "";
+  const rects = new Map(g.modules.map(m => [m.id, {...nodePos(m,g), width:316, height:154}]));
+  return g.hierarchy.families.filter(f => f.members.length > 1).map(f => {
+    const bounds = boundsOf(f.members.map(id => rects.get(id)!), 12);
+    // Old/manual positions may interleave unrelated families: don't draw a misleading enclosure.
+    if ([...rects].some(([id,r]) => !f.members.includes(id) && r.x < bounds.x + bounds.width && r.x + r.width > bounds.x && r.y < bounds.y + bounds.height && r.y + r.height > bounds.y)) return "";
+    return `<div class="type-family" data-type-family="${esc(f.root)}" style="left:${bounds.x-g.x}px;top:${bounds.y-g.y-20}px;width:${bounds.width}px;height:${bounds.height+20}px"><span>${text("Code hierarchy", "代码层级")} · ${f.members.length} ${text("types", "个类型")}</span></div>`;
+  }).join("");
+}
+function typeLinkPath(from: {x: number; y: number}, to: {x: number; y: number}) {
+  const rail = Math.min(from.x, to.x) - 18;
+  return `M ${from.x} ${from.y+77} H ${rail} V ${to.y+77} H ${to.x-4}`;
+}
 function renderMap() {
   const s = snapshot(),
     gs = groups(),
     active = activeModules();
-  const visible = (m: Module) => !collapsed.has(m.kind || "source");
+  const visibleIds = new Set(gs.flatMap(g=>g.modules.map(m=>m.id)));
+  const visible = (m: Module) =>
+    visibleIds.has(m.id) && !collapsed.has(m.kind || "source");
   const nodes = gs
     .map(
       (g, i) =>
-        `<section class="group ${collapsed.has(g.id) ? "collapsed" : ""}" data-group-box="${esc(g.id)}" style="left:${g.x}px;top:${g.y}px;width:${g.width}px;height:${g.height}px;--group-bg:${g.color[0]};--group-head:${g.color[1]};--group-line:${g.color[2]}" aria-label="${esc(g.title)}"><div class="group-header"><button class="group-head" data-drag-group="${esc(g.id)}" title="${text("Drag to move group; Alt + arrow keys", "拖动移动整组；Alt + 方向键也可移动")}"><span class="group-no">${String(i + 1).padStart(2, "0")}</span><span class="group-name">${esc(g.title)}</span><span aria-hidden="true">⠿</span></button><button class="group-toggle" data-group="${esc(g.id)}" aria-label="${text("Expand or collapse", "展开或收起")} ${esc(g.title)}" aria-expanded="${!collapsed.has(g.id)}">${collapsed.has(g.id) ? "＋" : "−"}</button></div><p class="group-subtitle">${g.modules.length} ${text("modules", "个模块")} · ${g.modules.reduce((n, m) => n + m.files.length, 0)} ${text("source files", "个源文件")}${collapsed.has(g.id) ? " · " + text("collapsed", "已收起") : ""}</p>${
+        `<section class="group ${collapsed.has(g.id) ? "collapsed" : ""}" data-group-box="${esc(g.id)}" style="left:${g.x}px;top:${g.y}px;width:${g.width}px;height:${g.height}px;--group-bg:${g.color[0]};--group-head:${g.color[1]};--group-line:${g.color[2]}" aria-label="${esc(g.title)}"><div class="group-header"><button class="group-head" data-drag-group="${esc(g.id)}" title="${text("Drag to move group; Alt + arrow keys", "拖动移动整组；Alt + 方向键也可移动")}"><span class="group-no">${String(i + 1).padStart(2, "0")}</span><span class="group-name">${esc(g.title)}</span><span aria-hidden="true">⠿</span></button><button class="group-toggle" data-group="${esc(g.id)}" aria-label="${text("Expand or collapse", "展开或收起")} ${esc(g.title)}" aria-expanded="${!collapsed.has(g.id)}">${collapsed.has(g.id) ? "＋" : "−"}</button></div><p class="group-subtitle">${g.modules.length} ${text("modules", "个模块")} · ${g.modules.reduce((n, m) => n + m.files.length, 0)} ${text("source files", "个源文件")}${collapsed.has(g.id) ? " · " + text("collapsed", "已收起") : ""}</p>${g.description ? `<p class="group-description" title="${esc(g.description)}">${esc(g.description)}</p>` : ""}${
           !collapsed.has(g.id)
-            ? g.modules
+            ? renderTypeFamilies(g) + g.modules
                 .map((m, j) => {
                   const p = nodePos(m, g);
-                  return `<button class="node status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? (active.has(m.id) ? "highlighted" : "dim") : ""}" data-node="${esc(m.id)}" aria-pressed="${selectedModule === m.id}" title="${text("Drag to move; click for details", "拖动调整位置；点击查看解释")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} ⠿</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${esc(m.name)}</span><span class="node-caption">${esc(m.description || text("Awaiting explanation", "等待说明"))}</span></button>`;
+                  return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? (active.has(m.id) ? "highlighted" : "dim") : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childModules(m.id).length ? text("Click for details; double-click to open internal architecture; drag to move", "单击查看信息；双击进入内部架构；拖动调整位置") : text("Drag to move; click for details", "拖动调整位置；点击查看解释")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} ⠿${childModules(m.id).length ? ` · ↳ ${childModules(m.id).length} ${text("submodules", "子模块")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "新增") : text("Changed", "变化")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "等待说明"))}</span></button>`;
                 })
                 .join("")
             : ""
@@ -338,7 +568,7 @@ function renderMap() {
   }));
   const bounds = boundsOf(rects, 180);
   const edges =
-    s?.edges
+    mapEdges()
       .map((e, i) => {
         const a = moduleById(e.from),
           b = moduleById(e.to);
@@ -349,10 +579,15 @@ function renderMap() {
           (active.size > 0 && active.has(e.from) && active.has(e.to)) ||
           (selectedModule &&
             (e.from === selectedModule || e.to === selectedModule));
-        return `<path class="edge ${e.confidence === "inferred" ? "reference" : ""} ${focus ? "active" : active.size ? "dim" : ""}" d="${edgePath(ar, br, i)}"><title>${esc(e.label)} · ${esc(confidence(e.confidence))}${e.evidence[0] ? " · " + esc(e.evidence[0].path) + (e.evidence[0].line ? ":" + e.evidence[0].line : "") : ""}</title></path>`;
+        return `<path data-from="${esc(e.from)}" data-to="${esc(e.to)}" data-route="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? "type" : "edge"}" data-route-index="${i}" data-change="${e.change || ""}" class="edge ${e.confidence === "inferred" ? "reference" : ""} ${focus ? "active" : active.size ? "dim" : ""}" d="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? typeLinkPath(ar, br) : edgePath(ar, br, i)}"><title>${esc(e.label)} · ${esc(confidence(e.confidence))}${e.evidence[0] ? " · " + esc(e.evidence[0].path) + (e.evidence[0].line ? ":" + e.evidence[0].line : "") : ""}</title></path>`;
       })
       .join("") || "";
-  return `<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "架构画布。拖动空白移动，滚轮缩放；方向键移动，加减键缩放，0 回到全图。")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "远端代码地图") : text("Start with your code", "从你的代码开始")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "开启并同步远端后，即可查看独立快照。") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "请让 Agent 使用 Nativue Skill，从已索引代码分析模块、源码证据和操作旅程。")}</p><button id="empty-role">${text("Get Agent instructions", "获取 Agent 指令")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "连线图例")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "源码关系")}</div><div><span class="line-sample reference"></span>${text("Inferred · needs verification", "推断 · 待核实")}</div><p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "箭头指向接收方，深色表示当前高亮。")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "画布视野")}"><button id="zoom-out" aria-label="${text("Zoom out", "缩小")}">−</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "放大")}">＋</button><span class="divider"></span><button id="fit">${text("Fit all", "全图")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "定位所选")}</button><button id="clear">${text("Clear", "清除高亮")}</button><button id="reset-layout">${text("Reset layout", "重置布局")}</button></div></div>`;
+  const containment = gs.flatMap(g => g.modules).map(m => {
+    const owner = moduleById(m.declaringTypeId || "");
+    if (!owner || !visible(m) || !visible(owner)) return "";
+    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(nodePos(owner),nodePos(m))}"><title>${esc(owner.name)} · ${text("contains", "包含内部类型")} ${esc(m.name)}</title></path>`;
+  }).join("");
+  return `${renderMapNavigation()}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "架构画布。拖动空白移动，滚轮缩放；方向键移动，加减键缩放，0 回到全图。")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "远端代码地图") : text("Start with your code", "从你的代码开始")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "开启并同步远端后，即可查看独立快照。") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "请让 Agent 使用 Nativue Skill，从已索引代码分析模块、源码证据和操作旅程。")}</p><button id="empty-role">${text("Get Agent instructions", "获取 Agent 指令")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "连线图例")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "源码关系")}</div><div><span class="line-sample reference"></span>${text("Inferred · needs verification", "推断 · 待核实")}</div>${gs.some(g => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "无箭头括线：内部类型归属")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "箭头指向接收方，深色表示当前高亮。")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "画布视野")}"><button id="zoom-out" aria-label="${text("Zoom out", "缩小")}">−</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "放大")}">＋</button><span class="divider"></span><button id="fit">${text("Fit all", "全图")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "定位所选")}</button><button id="clear">${text("Clear", "清除高亮")}</button>${gs.some(g => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "按源码关系重新排列当前功能下的类型")}">${text("Arrange code hierarchy", "按代码层级排列")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "重置布局")}</button></div></div>`;
 }
 function boundsOf(
   rects: { x: number; y: number; width: number; height: number }[],
@@ -481,14 +716,26 @@ function renderUpdates() {
 function renderSelectionEmpty() {
   return `<span class="eyebrow">${text("Source-linked explanations", "关联源码的解释")}</span><h2>${text("Select a module or follow a journey", "点模块，或逐步走一次旅程")}</h2><p>${text("Inspect responsibilities, related connections, source evidence, and actual files. Architecture confidence does not replace independent runtime acceptance.", "查看模块职责、关联关系、源码证据和实际文件。架构可信度不能代替独立运行验收。")}</p>`;
 }
+function renderResponsibility(m: Module) {
+  const manual = m.descriptionOrigin === "manual";
+  const origin = manual ? text("Manually edited · kept on refresh", "手动编辑 · 更新后保留") : m.descriptionOrigin === "source-comment" ? text("From source comments", "源码注释自动填充") : text("Automatically generated", "自动生成");
+  return `<section class="explain-field responsibility"><div class="responsibility-heading"><h3>${text("What it does", "它负责什么")}</h3><button id="edit-description">${text("Edit", "编辑")}</button></div><small class="description-origin">${origin}</small><p class="responsibility-text">${esc(m.description || text("No explanation yet.", "尚无说明。"))}</p>${manual ? `<details><summary>${text("Latest automatic content", "最新自动内容")}</summary><p class="responsibility-text">${esc(m.automaticDescription || text("No automatic explanation yet.", "暂无自动说明。"))}</p></details>` : ""}${(m.descriptionEvidence || []).map(e => `<button class="source-link comment-evidence" data-file="${esc(e.path)}"><code>${esc(e.path)}:${e.line}</code><span>${text("Automatic content source", "自动内容来源")} ↗</span></button>`).join("")}</section>`;
+}
+function renderFeatureSettings(m: Module) {
+  if (m.generator !== "java") return "";
+  if (m.level === "feature") return `<section class="explain-field feature-settings"><div class="responsibility-heading"><h3>${text("Feature name", "功能名称")}</h3><button id="edit-feature-name">${text("Rename", "重命名")}</button></div><p>${esc(m.name)}</p><small class="description-origin">${m.nameOrigin === "manual" ? text("Manually named · kept on refresh", "手动命名 · 更新后保留") : text("Automatically identified", "自动识别")}${m.automaticName !== undefined ? `<br>${text("Automatic name", "自动识别名称")}: ${esc(m.automaticName)}` : ""}</small></section>`;
+  if (m.level !== "class") return "";
+  const parent = moduleById(m.parentId || ""), automatic = moduleById(m.automaticParentId || m.parentId || "");
+  return `<section class="explain-field feature-settings"><div class="responsibility-heading"><h3>${text("Feature membership", "功能归属")}</h3><button id="edit-class-feature">${text("Change feature", "调整归属")}</button></div><p>${esc(parent?.name || text("Unassigned", "未归属"))}</p><small class="description-origin">${m.parentOrigin === "manual" ? text("Manually assigned · kept on refresh", "手动指定 · 更新后保留") : text("Automatically identified", "自动识别")}${m.parentOrigin === "manual" ? `<br>${text("Automatic feature", "自动识别归属")}: ${esc(automatic?.name || text("Unavailable", "暂无"))}` : ""}${m.pendingParentId ? `<br>${text("Saved target is unavailable; showing the automatic feature. Your setting is retained.", "手动目标功能已不存在，暂用自动归属；原设置仍保留。")}` : ""}</small></section>`;
+}
 function renderModuleDetail(m: Module | undefined) {
   if (!m) return renderSelectionEmpty();
-  return `<span class="eyebrow">${esc(groupTitle(m.kind))} / ${text("module", "小模块")}</span><h2>${esc(m.name)}</h2><span class="status-tag status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"}">${esc(confidence(m.confidence))}</span><section class="explain-field"><h3>${text("What it does", "它负责什么")}</h3><p>${esc(m.description || text("No explanation yet.", "尚无说明。"))}</p></section><section class="explain-field"><h3>${text("What its connections carry", "相关连线传的是什么")}</h3>${
+  return `<span class="eyebrow">${esc(groupTitle(m.kind))} / ${esc(m.level || text("module", "小模块"))}</span><h2>${esc(m.name)}</h2>${m.level === "method" ? `<button id="show-call-chain">${text("Explore call chain", "查看调用链")} →</button>` : ""}${childModules(m.id).length && mapParent !== m.id ? `<button id="enter-module">${text("Open internal architecture", "进入内部架构")} →</button>` : ""}<span class="status-tag status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"}">${esc(confidence(m.confidence))}</span>${renderFeatureSettings(m)}${m.level === "class" && typeRelations(m).length ? `<section class="explain-field type-relationships"><h3>${text("Code hierarchy", "代码层级")}</h3>${typeRelations(m).map(r => `<button class="source-link" data-symbol-target="${esc(r.target.id)}">${esc(r.label)} · ${esc(r.target.name)} →</button>`).join("")}</section>` : ""}${renderResponsibility(m)}<section class="explain-field"><h3>${text("What its connections carry", "相关连线传的是什么")}</h3>${
     snapshot()
       ?.edges.filter((e) => e.from === m.id || e.to === m.id)
       .map(
         (e) =>
-          `<button class="connection-item" data-edge="${esc(e.id)}">${esc(moduleById(e.from)?.name || e.from)} → ${esc(moduleById(e.to)?.name || e.to)}<small>${esc(e.label)} · ${esc(confidence(e.confidence))}</small></button>`,
+          `<button class="connection-item" data-edge="${esc(e.id)}">${esc(moduleById(e.from)?.name || e.from)} → ${esc(moduleById(e.to)?.name || e.to)}<small>${esc(e.label)} · ${esc(confidence(e.confidence))}</small></button>${e.generator === "java" ? `<button class="symbol-target" data-symbol-target="${esc(e.from === m.id ? e.to : e.from)}">${text("Go to related declaration", "转到关联声明")} →</button>` : ""}`,
       )
       .join("") ||
     `<p>${text("No relationships recorded.", "暂无已记录关系。")}</p>`
@@ -496,7 +743,8 @@ function renderModuleDetail(m: Module | undefined) {
 }
 function currentJourney() {
   const list = snapshot()?.journeys || [];
-  return list.find((j) => j.id === selectedJourney) || list[0];
+  return list.find((j) => j.id === selectedJourney) ||
+    (mapParent ? list.find(j => j.steps.some(step => moduleTrail(step.moduleId).some(m => m.id === mapParent))) : undefined) || list[0];
 }
 function renderJourneyNav() {
   const j = currentJourney();
@@ -580,7 +828,7 @@ function renderTaskDetail(t: Task | undefined) {
     .map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`)
     .join(
       "",
-    )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Claimed files", "认领文件")}</div>${t.files.map((p) => `<button class="evidence" data-file="${esc(p)}">${esc(p)}</button>`).join("") || "—"}<div class="section-label">${text("Review evidence", "验收证据")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C 验收")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "尚无独立验收记录。")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "集成验收")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "用户确认")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "复制")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "编辑 / 提交交接记录")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "验收必须绑定实际提交。只有用户能确认手测通过。")}</p>`;
+    )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "验收证据")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C 验收")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "尚无独立验收记录。")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "集成验收")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "用户确认")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "复制")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "编辑 / 提交交接记录")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "验收必须绑定实际提交。只有用户能确认手测通过。")}</p>`;
 }
 function locateFile(path: string, files?: string[]) {
   if (!snapshot()?.files.some(file => file.path === path)) {
@@ -617,16 +865,19 @@ function stepFile(delta: number) {
 function selectModule(id: string, fromJourney = false) {
   selectedModule = id;
   selectedTask = "";
+  if (tab === "folders") tab = "updates";
   const m = moduleById(id);
   if (m) collapsed.delete(m.kind || "source");
   if (!fromJourney) journeyStep = -1;
+  // Browsers can scroll a clipped card into view when focusing it. Preserve that
+  // visual position across the rerender so the second click hits the same card.
+  const viewport = document.getElementById("viewport");
+  view.x -= viewport?.scrollLeft || 0;
+  view.y -= viewport?.scrollTop || 0;
   render();
-  if (tab !== "folders")
-    requestAnimationFrame(() =>
-      document
-        .querySelector("#selection")
-        ?.scrollIntoView({ block: "start", behavior: "smooth" }),
-    );
+  requestAnimationFrame(() =>
+    document.querySelector("#selection")?.scrollIntoView({ block: "start", behavior: "smooth" }),
+  );
 }
 function selectTask(id: string) {
   selectedTask = id;
@@ -648,6 +899,13 @@ function selectTask(id: string) {
 function showJourney(index: number) {
   const j = currentJourney();
   if (!j) return;
+  selectedJourney = j.id;
+  const nextStep = j.steps[index];
+  const trails = j.steps.map(step => moduleTrail(step.moduleId).slice(0, -1));
+  const common = trails[0]?.filter(m => trails.every(trail => trail.some(n => n.id === m.id))).at(-1)?.id || "";
+  const parent = nextStep ? moduleById(nextStep.moduleId)?.parentId || "" : common;
+  navigateMap(parent);
+  tab = "journeys";
   journeyStep = Math.max(-1, Math.min(j.steps.length - 1, index));
   selectedTask = "";
   selectedModule = journeyStep >= 0 ? j.steps[journeyStep].moduleId : "";
@@ -662,6 +920,21 @@ function showJourney(index: number) {
 function bind() {
   const on = (id: string, fn: () => void) =>
     document.getElementById(id)?.addEventListener("click", fn);
+  on("map-up", () => navigateMap(callRoot ? mapParent : moduleById(mapParent)?.parentId || ""));
+  on("show-call-chain", () => navigateMap(mapParent, selectedModule));
+  document.querySelectorAll<HTMLButtonElement>("[data-symbol-target]").forEach(el =>
+    el.addEventListener("click", () => { const id = el.dataset.symbolTarget!, m = moduleById(id); if (!m) return; navigateMap(m.parentId || ""); selectedModule = id; render(); focusModule(id); }),
+  );
+  on("enter-module", () => navigateMap(selectedModule));
+  on("edit-description", openDescriptionEditor);
+  on("edit-feature-name", () => openArchitectureEditor("name"));
+  on("edit-class-feature", () => openArchitectureEditor("parentId"));
+  document.querySelectorAll<HTMLButtonElement>("[data-map-scope]").forEach((el) =>
+    el.addEventListener("click", () => navigateMap(el.dataset.mapScope!)),
+  );
+  document.querySelector<HTMLInputElement>("#module-search")?.addEventListener("input", e => {
+    mapQuery = (e.target as HTMLInputElement).value; render(); if (mapQuery) fitGraph();
+  });
   on("language-button", () => {
     lang = lang === "zh" ? "en" : "zh";
     localStorage.setItem("nativue-language", lang);
@@ -728,6 +1001,15 @@ function bind() {
     related = [];
     render();
   });
+  on("arrange-code", () => {
+    // Only the current scope is changed; other saved views are left intact.
+    mapQuery = "";
+    nodePositions.clear();
+    groupPositions.clear();
+    collapsed.clear();
+    render();
+    fitGraph();
+  });
   on("reset-layout", () => {
     nodePositions.clear();
     groupPositions.clear();
@@ -763,6 +1045,10 @@ function bind() {
     .querySelector<HTMLSelectElement>("#version-picker")
     ?.addEventListener("change", (e) => {
       source = (e.target as HTMLSelectElement).value as typeof source;
+      mapParent = "";
+      callRoot = "";
+      layoutKey = "";
+      mapLocations.clear();
       selectedModule = "";
       selectedFile = "";
       selectedJourney = "";
@@ -771,6 +1057,7 @@ function bind() {
       groupPositions.clear();
       initialFit = false;
       view = { x: 0, y: 0, scale: 1 };
+      restoreMap();
       render();
     });
   document
@@ -883,7 +1170,8 @@ function zoom(factor: number, x?: number, y?: number, board = false) {
   else view = next;
   paintView(board);
 }
-function paintView(board = false) {
+function paintView(board = false, persist = true) {
+  if (!board && persist) rememberMap();
   const v = board ? boardView : view,
     world = document.getElementById(board ? "parallel-groups" : "world"),
     vp = document.getElementById(board ? "parallel-viewport" : "viewport");
@@ -909,7 +1197,7 @@ function fitGraph() {
           : g.modules.map((m) => ({
               ...nodePos(m, g),
               width: 316,
-              height: 124,
+              height: g.hierarchy ? 154 : 124,
             })),
       ),
     ],
@@ -931,9 +1219,16 @@ function fitBoard() {
   paintView(true);
 }
 function focusModule(id: string) {
+  const target = moduleById(id);
+  if (target && target.id !== mapParent && !callRoot)
+    navigateMap(target.parentId || "");
   const m = moduleById(id),
     vp = document.getElementById("viewport");
   if (!m || !vp) return;
+  if (id === mapParent) {
+    fitGraph();
+    return;
+  }
   collapsed.delete(m.kind || "source");
   const p = nodePos(m);
   view = fitView(
@@ -952,96 +1247,148 @@ function moveGroup(id: string, dx: number, dy: number) {
     const p = nodePos(m, g);
     nodePositions.set(m.id, { x: p.x + dx, y: p.y + dy });
   }
-  groupPositions.set(id, { x: g.x + dx, y: g.y + dy });
+  groupPositions.set(id, { x: g.x + dx, y: g.y + dy, columns: g.columns });
 }
+// Selection rerenders the cards, so native dblclick cannot retain its target.
+let lastNodeClick: {id: string; scope: string; at: number; x: number; y: number} | null = null;
 function bindCanvas(board = false) {
   const vp = document.getElementById(board ? "parallel-viewport" : "viewport");
   if (!vp) return;
   stageSize = { width: vp.clientWidth, height: vp.clientHeight };
-  let drag: {
+  type Point = {x: number; y: number};
+  type Drag = {
     type: "pan" | "node" | "group";
-    id: string;
-    startX: number;
-    startY: number;
-    lastX: number;
-    lastY: number;
-    ox: number;
-    oy: number;
-    moved: boolean;
-  } | null = null;
+    id: string; pointerId: number; startX: number; startY: number;
+    x: number; y: number; origin: typeof view; moved: boolean;
+    layout: {group: Group; positions: Map<string, Point>}[];
+    points: Map<string, Point>; affected: Set<string>; element: HTMLElement | null;
+    paths: {element: SVGPathElement; from: string; to: string; type: boolean; index: number}[];
+  };
+  let drag: Drag | null = null, frame = 0;
+  const drawDrag = () => {
+    frame = 0;
+    const d = drag;
+    if (!d?.moved) return;
+    const dx = d.x - d.startX, dy = d.y - d.startY;
+    if (d.type === "pan") {
+      const current = board ? boardView : view;
+      current.x = d.origin.x + dx;
+      current.y = d.origin.y + dy;
+      paintView(board, false);
+    } else {
+      const mx = dx / d.origin.scale, my = dy / d.origin.scale;
+      if (d.element) d.element.style.transform = `translate(${mx}px,${my}px)`;
+      const position = (id: string) => {
+        const p = d.points.get(id)!;
+        return d.affected.has(id) ? {x:p.x + mx, y:p.y + my} : p;
+      };
+      for (const p of d.paths) p.element.setAttribute("d", p.type
+        ? typeLinkPath(position(p.from), position(p.to))
+        : edgePath(position(p.from), position(p.to), p.index));
+    }
+  };
+  const finishDrag = (cancelled = false, ev?: PointerEvent) => {
+    const d = drag;
+    if (!d) return;
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    if (ev && !cancelled) { d.x = ev.clientX; d.y = ev.clientY; }
+    if (cancelled) {
+      if (board) boardView = {...d.origin}; else view = {...d.origin};
+    } else if (d.moved) {
+      drawDrag();
+      if (d.type !== "pan") {
+        const dx = (d.x - d.startX) / d.origin.scale, dy = (d.y - d.startY) / d.origin.scale;
+        // Pin every visible group's origin before changing its bounds: siblings
+        // must not reflow as the dragged node expands its original group.
+        for (const {group:g, positions} of d.layout) {
+          groupPositions.set(g.id, {x:g.x, y:g.y, columns:g.columns});
+          for (const [id,p] of positions) nodePositions.set(id,
+            d.affected.has(id) ? {x:p.x + dx, y:p.y + dy} : p);
+        }
+        if (d.type === "group") {
+          const g = d.layout.find(l=>l.group.id === d.id)!.group;
+          groupPositions.set(d.id, {x:g.x + dx, y:g.y + dy, columns:g.columns});
+        }
+      }
+    }
+    drag = null;
+    canvasGestureActive = false;
+    vp.classList.remove("is-dragging", "is-dragging-node");
+    window.removeEventListener("blur", cancelDrag);
+    if (vp.hasPointerCapture(d.pointerId)) vp.releasePointerCapture(d.pointerId);
+    const pending = canvasRenderPending;
+    canvasRenderPending = false;
+    if (!cancelled && d.type === "node" && !d.moved && ev) {
+      const scope = source + ":" + scopeKey();
+      const doubleClick = lastNodeClick?.id === d.id && lastNodeClick.scope === scope &&
+        ev.timeStamp - lastNodeClick.at <= 500 &&
+        Math.hypot(ev.clientX - lastNodeClick.x, ev.clientY - lastNodeClick.y) <= 8;
+      lastNodeClick = doubleClick ? null : {id:d.id, scope, at:ev.timeStamp, x:ev.clientX, y:ev.clientY};
+      if (doubleClick && childModules(d.id).length) navigateMap(d.id);
+      selectModule(d.id);
+    } else {
+      lastNodeClick = null;
+      if (cancelled || d.type !== "pan" || pending) render();
+      else paintView(board);
+    }
+    if (pending) void refresh();
+  };
+  const cancelDrag = () => finishDrag(true);
   vp.addEventListener("pointerdown", (ev) => {
-    if (
-      ev.button !== 0 ||
-      (ev.target as Element).closest("[data-group],.map-empty")
-    )
-      return;
+    if (drag || ev.button !== 0 || !ev.isPrimary ||
+        (ev.target as Element).closest("[data-group],.map-empty")) return;
     const node = (ev.target as Element).closest<HTMLElement>("[data-node]"),
       group = (ev.target as Element).closest<HTMLElement>("[data-drag-group]");
     if (board && (ev.target as Element).closest("button")) return;
+    if (!node) lastNodeClick = null;
     const current = board ? boardView : view;
-    drag = {
-      type: node ? "node" : group ? "group" : "pan",
-      id: node?.dataset.node || group?.dataset.dragGroup || "",
-      startX: ev.clientX,
-      startY: ev.clientY,
-      lastX: ev.clientX,
-      lastY: ev.clientY,
-      ox: current.x,
-      oy: current.y,
-      moved: false,
-    };
+    // Fold browser-native focus scrolling into canvas coordinates once.
+    current.x -= vp.scrollLeft; current.y -= vp.scrollTop;
+    vp.scrollLeft = 0; vp.scrollTop = 0;
+    paintView(board, false);
+    const layout = node || group ? groups().map(g => ({group:g,
+      positions:new Map(g.modules.map(m=>[m.id,{...nodePos(m,g)}]))})) : [];
+    const points = new Map(layout.flatMap(l=>[...l.positions]));
+    const affected = new Set(node ? [node.dataset.node!] :
+      layout.find(l=>l.group.id === group?.dataset.dragGroup)?.group.modules.map(m=>m.id) || []);
+    const paths = [...vp.querySelectorAll<SVGPathElement>("path.edge,path.containment")].map(element=>({
+      element, from:element.dataset.from || element.dataset.owner || "",
+      to:element.dataset.to || element.dataset.member || "",
+      type:element.classList.contains("containment") || element.dataset.route === "type",
+      index:Number(element.dataset.routeIndex || 0),
+    })).filter(p=>points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to)));
+    drag = {type:node ? "node" : group ? "group" : "pan",
+      id:node?.dataset.node || group?.dataset.dragGroup || "", pointerId:ev.pointerId,
+      startX:ev.clientX, startY:ev.clientY, x:ev.clientX, y:ev.clientY,
+      origin:{...current}, moved:false, layout, points, affected,
+      element:node || group?.closest<HTMLElement>("[data-group-box]") || null, paths};
+    canvasGestureActive = true;
+    window.addEventListener("blur", cancelDrag);
+    vp.focus({preventScroll:true});
     vp.setPointerCapture(ev.pointerId);
     ev.preventDefault();
   });
   vp.addEventListener("pointermove", (ev) => {
-    if (!drag) return;
-    const dx = ev.clientX - drag.startX,
-      dy = ev.clientY - drag.startY;
-    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
-    const current = board ? boardView : view;
-    if (drag.type === "pan") {
-      current.x = drag.ox + dx;
-      current.y = drag.oy + dy;
-      paintView(board);
-    } else {
-      const mx = (ev.clientX - drag.lastX) / current.scale,
-        my = (ev.clientY - drag.lastY) / current.scale;
-      if (drag.type === "group") moveGroup(drag.id, mx, my);
-      else {
-        const m = moduleById(drag.id);
-        if (m) {
-          const p = nodePos(m);
-          nodePositions.set(m.id, { x: p.x + mx, y: p.y + my });
-        }
-      }
-      drag.lastX = ev.clientX;
-      drag.lastY = ev.clientY;
-      const shell = document.querySelector(".canvas-shell");
-      if (shell) {
-        const scratch = document.createElement("div");
-        scratch.innerHTML = renderMap();
-        const incoming = scratch.querySelector("#world"),
-          existing = document.getElementById("world");
-        if (incoming && existing) existing.innerHTML = incoming.innerHTML;
-      }
-    }
+    if (!drag || drag.pointerId !== ev.pointerId) return;
+    drag.x = ev.clientX; drag.y = ev.clientY;
+    if (!drag.moved && Math.hypot(drag.x - drag.startX, drag.y - drag.startY) <= 4) return;
+    drag.moved = true;
+    lastNodeClick = null;
+    vp.classList.add("is-dragging");
+    if (drag.type === "node") vp.classList.add("is-dragging-node");
+    if (!frame) frame = requestAnimationFrame(drawDrag);
   });
-  vp.addEventListener("pointerup", (ev) => {
-    if (!drag) return;
-    const d = drag;
-    drag = null;
-    if (vp.hasPointerCapture(ev.pointerId))
-      vp.releasePointerCapture(ev.pointerId);
-    if (d.type === "node" && !d.moved) selectModule(d.id);
-    else if (d.type !== "pan") render();
+  vp.addEventListener("pointerup", ev => {
+    if (drag?.pointerId === ev.pointerId) finishDrag(false, ev);
   });
-  vp.addEventListener("pointercancel", () => {
-    drag = null;
-  });
+  vp.addEventListener("pointercancel", cancelDrag);
+  vp.addEventListener("lostpointercapture", cancelDrag);
   vp.addEventListener(
     "wheel",
     (ev) => {
       ev.preventDefault();
+      if (drag) return;
       const rect = vp.getBoundingClientRect(),
         delta =
           ev.deltaY *
@@ -1056,6 +1403,7 @@ function bindCanvas(board = false) {
     { passive: false },
   );
   vp.addEventListener("keydown", (ev) => {
+    if (drag) { ev.preventDefault(); if (ev.key === "Escape") cancelDrag(); return; }
     if (ev.altKey && !board) {
       const node = (ev.target as Element).closest<HTMLElement>("[data-node]"),
         group = (ev.target as Element).closest<HTMLElement>(
@@ -1126,7 +1474,10 @@ function bindCanvas(board = false) {
   if (!board) {
     document.querySelectorAll<HTMLElement>("[data-node]").forEach((el) =>
       el.addEventListener("click", (e) => {
-        if (e.detail === 0) selectModule(el.dataset.node!);
+        if (e.detail === 0) {
+          lastNodeClick = null;
+          selectModule(el.dataset.node!);
+        }
       }),
     );
   }
@@ -1219,6 +1570,77 @@ function closeModal() {
   modalCleanup = undefined;
   document.querySelector(".modal-backdrop")?.remove();
   modal = "";
+}
+function openArchitectureEditor(field: "name" | "parentId") {
+  const m = moduleById(selectedModule);
+  if (!m || !data) return;
+  const revision = data.architectureRevision || 0, editSource = source;
+  const naming = field === "name";
+  const autoParent = moduleById(m.automaticParentId || m.parentId || "");
+  const choices = snapshot()!.modules.filter(n => n.generator === "java" && n.level === "feature" && n.parentId === autoParent?.parentId);
+  const isManual = naming ? m.nameOrigin === "manual" : m.parentOrigin === "manual" || !!m.pendingParentId;
+  const automatic = naming ? m.automaticName ?? m.name : autoParent?.name || text("Unavailable", "暂无自动归属");
+  const shell = openModal(naming ? text("Rename feature", "修改功能名称") : text("Change class feature", "调整类的功能归属"),
+    `<form id="architecture-form"><p>${esc(m.symbol || m.name)}</p><p class="fine">${text("Your setting survives analysis refreshes. You can restore the latest automatic result independently.", "手动设置在重新分析后保留，可以单独恢复到最新自动结果。")}</p><div class="form-row"><label for="architecture-value">${naming ? text("Feature name", "功能名称") : text("Target feature", "目标功能")}</label>${naming ? `<input id="architecture-value" name="value" required maxlength="100" value="${esc(m.name)}">` : `<select id="architecture-value" name="value">${choices.map(n => `<option value="${esc(n.id)}" ${n.id === m.parentId ? "selected" : ""}>${esc(n.name)}</option>`).join("")}</select>`}</div><p class="fine">${text("Latest automatic result", "最新自动识别结果")}: ${esc(automatic)}</p><p id="architecture-error" role="alert" class="description danger"></p><div class="form-actions"><button type="button" id="cancel-architecture">${text("Cancel", "取消")}</button>${isManual ? `<button type="button" id="reset-architecture">${text("Restore automatic result", "恢复自动识别")}</button>` : ""}<button class="primary" type="submit">${text("Save", "保存")}</button></div></form>`);
+  let saving = false;
+  const submit = async (value: string | null) => {
+    if (saving) return;
+    saving = true;
+    shell.querySelectorAll<HTMLButtonElement>(".form-actions button").forEach(b => b.disabled = true);
+    try {
+      await api("/api/architecture-edits", {source: editSource, moduleId: m.id, field, value, revision});
+      closeModal();
+      await refresh();
+      if (!naming && source === editSource) {
+        const updated = moduleById(m.id);
+        if (updated) {
+          navigateMap(updated.parentId || "");
+          selectedModule = updated.id;
+          render();
+          focusModule(updated.id);
+        }
+      }
+      toast(value === null ? text("Automatic result restored.", "已恢复自动识别结果。") : text("Feature setting saved.", "功能设置已保存。"));
+    } catch (e) { shell.querySelector("#architecture-error")!.textContent = String(e); }
+    finally { saving = false; shell.querySelectorAll<HTMLButtonElement>(".form-actions button").forEach(b => b.disabled = false); }
+  };
+  shell.querySelector("#architecture-form")!.addEventListener("submit", e => {
+    e.preventDefault();
+    void submit(shell.querySelector<HTMLInputElement | HTMLSelectElement>("#architecture-value")!.value);
+  });
+  shell.querySelector("#cancel-architecture")!.addEventListener("click", closeModal);
+  shell.querySelector("#reset-architecture")?.addEventListener("click", () => void submit(null));
+}
+function openDescriptionEditor() {
+  const m = moduleById(selectedModule);
+  if (!m || !data) return;
+  const revision = data.descriptionRevision || 0, editSource = source;
+  const automatic = m.automaticDescription ?? m.description;
+  const shell = openModal(text("Edit responsibility", "编辑职责说明"),
+    `<form id="description-form"><p>${esc(m.name)}</p><p class="fine">${text("Your edit is kept when source analysis refreshes. Restore automatic content to use the latest source explanation.", "手动修改在重新分析后保留。恢复自动内容后，将使用最新的源码说明。")}</p><div class="form-row"><label for="description-text">${text("What it does", "它负责什么")}</label><textarea id="description-text" name="description" maxlength="12000" rows="8">${esc(m.description)}</textarea></div><details><summary>${text("Latest automatic content", "最新自动内容")}</summary><p class="responsibility-text">${esc(automatic)}</p></details><p id="description-error" role="alert" class="description danger"></p><div class="form-actions"><button type="button" id="cancel-description">${text("Cancel", "取消")}</button>${m.descriptionOrigin === "manual" ? `<button type="button" id="reset-description">${text("Restore automatic content", "恢复自动内容")}</button>` : ""}<button class="primary" type="submit">${text("Save", "保存")}</button></div></form>`);
+  let saving = false;
+  const submit = async (description: string | null) => {
+    if (saving) return;
+    saving = true;
+    shell.querySelectorAll<HTMLButtonElement>(".form-actions button").forEach(b => b.disabled = true);
+    try {
+      await api("/api/descriptions", {source: editSource, moduleId: m.id, revision, description});
+      closeModal();
+      await refresh();
+      toast(description === null ? text("Automatic content restored.", "已恢复自动内容。") : text("Responsibility saved.", "职责说明已保存。"));
+    } catch (e) {
+      shell.querySelector("#description-error")!.textContent = String(e);
+    } finally {
+      saving = false;
+      shell.querySelectorAll<HTMLButtonElement>(".form-actions button").forEach(b => b.disabled = false);
+    }
+  };
+  shell.querySelector("#description-form")!.addEventListener("submit", e => {
+    e.preventDefault();
+    void submit(shell.querySelector<HTMLTextAreaElement>("#description-text")!.value);
+  });
+  shell.querySelector("#cancel-description")!.addEventListener("click", closeModal);
+  shell.querySelector("#reset-description")?.addEventListener("click", () => void submit(null));
 }
 function openSettings() {
   if (!data) return;

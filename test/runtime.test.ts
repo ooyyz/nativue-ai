@@ -110,6 +110,27 @@ test("runtime preserves prior semantics with stale label, handles deletion and q
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+test("incremental files in one directory merge into one importable fallback module", async () => {
+  const root = fixture();
+  try {
+    const runtime = new Runtime(root);
+    await runtime.scan(true);
+    const initial = readSnapshot(root)!;
+    await importAnalysis(root,{schemaVersion:1,inputId:initial.id,modules:initial.modules,edges:initial.edges,journeys:[]});
+    for (const name of ["first","second","third"]) {
+      fs.writeFileSync(path.join(root,"server",name+".ts"),`export const ${name}=1;`);
+      await runtime.scan(true);
+    }
+    const snapshot = readSnapshot(root)!;
+    assert.equal(new Set(snapshot.modules.map(m=>m.id)).size,snapshot.modules.length);
+    const fallback = snapshot.modules.filter(m=>m.id.startsWith("scan-") && m.files.includes("server/first.ts"));
+    assert.equal(fallback.length,1);
+    assert.deepEqual([...fallback[0].files].sort(),["server/first.ts","server/second.ts","server/third.ts"]);
+    await importAnalysis(root,{schemaVersion:1,inputId:snapshot.id,modules:snapshot.modules,edges:snapshot.edges,journeys:[]});
+  } finally {
+    fs.rmSync(root,{recursive:true,force:true});
+  }
+});
 test("background runner accepts stdin JSON and records budget, malformed results retain last map", async () => {
   const root = fixture();
   try {
@@ -191,6 +212,22 @@ test("local HTTP validates host/origin, requires mutation token and confines fil
   } finally {
     app.close();
     await new Promise((r) => setTimeout(r, 50));
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+test("server shutdown stops refresh writes to open event streams", async () => {
+  const root = fixture();
+  const app = await serve(root, 0);
+  const events = await fetch(app.url + "/api/events");
+  const reader = events.body!.getReader();
+  try {
+    await reader.read();
+    await app.close();
+    app.runtime.emit();
+    await new Promise((r) => setTimeout(r, 20));
+  } finally {
+    await reader.cancel();
+    await app.close();
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

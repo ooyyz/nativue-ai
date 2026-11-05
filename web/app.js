@@ -1,3 +1,71 @@
+// web/code-hierarchy.ts
+function codeHierarchy(modules, edges, columns = 2) {
+  const byId = new Map(modules.map((m) => [m.id, m]));
+  const compare = (a, b) => {
+    const left = byId.get(a), right = byId.get(b);
+    return (left.symbol || left.name).localeCompare(right.symbol || right.name) || a.localeCompare(b);
+  };
+  const ids = [...byId.keys()].sort(compare);
+  const parents = /* @__PURE__ */ new Map();
+  for (const id of ids) {
+    const owner = byId.get(id).declaringTypeId;
+    if (owner && byId.has(owner) && owner !== id) parents.set(id, { parent: owner, relation: "contains" });
+  }
+  const candidates = edges.filter((e) => (e.relation === "implements" || e.relation === "extends") && byId.has(e.from) && byId.has(e.to) && e.from !== e.to).sort((a, b) => compare(a.from, b.from) || Number(a.relation !== "implements") - Number(b.relation !== "implements") || compare(a.to, b.to));
+  for (const edge of candidates) {
+    if (parents.has(edge.from)) continue;
+    const visited = /* @__PURE__ */ new Set([edge.from]);
+    let cursor = edge.to;
+    while (cursor && !visited.has(cursor)) {
+      visited.add(cursor);
+      cursor = parents.get(cursor)?.parent;
+    }
+    if (!cursor) parents.set(edge.from, { parent: edge.to, relation: edge.relation });
+  }
+  for (const id of ids) {
+    const visited = /* @__PURE__ */ new Set();
+    let cursor = id;
+    while (cursor && !visited.has(cursor)) {
+      visited.add(cursor);
+      cursor = parents.get(cursor)?.parent;
+    }
+    if (cursor) parents.delete(cursor);
+  }
+  const children = /* @__PURE__ */ new Map();
+  for (const id of ids) {
+    const parent = parents.get(id)?.parent;
+    if (parent) children.set(parent, [...children.get(parent) || [], id]);
+  }
+  for (const siblings of children.values()) siblings.sort((a, b) => Number(parents.get(a)?.relation === "contains") - Number(parents.get(b)?.relation === "contains") || compare(a, b));
+  const families = [];
+  const depths = /* @__PURE__ */ new Map();
+  for (const root of ids.filter((id) => !parents.has(id))) {
+    const members = [];
+    const visit = (id, depth) => {
+      members.push(id);
+      depths.set(id, depth);
+      for (const child of children.get(id) || []) visit(child, depth + 1);
+    };
+    visit(root, 0);
+    families.push({ root, members });
+  }
+  families.sort((a, b) => Number(b.members.length > 1) - Number(a.members.length > 1) || compare(a.root, b.root));
+  const count = Math.max(1, Math.min(4, columns, families.length));
+  const inset = (id) => Math.min(depths.get(id) || 0, 6) * 28;
+  const laneWidth = 374 + Math.max(0, ...ids.map(inset));
+  const bottoms = Array(count).fill(0);
+  const positions = /* @__PURE__ */ new Map();
+  for (const family of families) {
+    const lane = bottoms.indexOf(Math.min(...bottoms));
+    family.members.forEach((id, row) => positions.set(id, {
+      x: lane * laneWidth + inset(id),
+      y: bottoms[lane] + 32 + row * 184
+    }));
+    bottoms[lane] += 32 + family.members.length * 184 + 24;
+  }
+  return { positions, parents, families, width: count * laneWidth - 24, height: Math.max(0, ...bottoms) };
+}
+
 // web/app.ts
 var app = document.querySelector("#app");
 var esc = (value) => String(value ?? "").replace(
@@ -17,6 +85,13 @@ var selectedFile = "";
 var search = "";
 var related = [];
 var relatedOnly = false;
+var mapParent = "";
+var callRoot = "";
+var layoutKey = "";
+var mapQuery = "";
+var canvasGestureActive = false;
+var canvasRenderPending = false;
+var mapLocations = /* @__PURE__ */ new Map();
 var modal = "";
 var modalCleanup;
 var busy = false;
@@ -49,6 +124,108 @@ var labels = {
 var statusLabel = (s) => labels[s] ? text(...labels[s]) : s;
 var snapshot = () => data ? source === "remote" ? data.remote : data.local : null;
 var moduleById = (id) => snapshot()?.modules.find((m) => m.id === id);
+var childModules = (id) => snapshot()?.modules.filter((m) => (m.parentId || "") === id) || [];
+function callChainModules() {
+  const ids = /* @__PURE__ */ new Set([callRoot]), queue = [{ id: callRoot, depth: 0 }];
+  const calls = snapshot()?.edges.filter((e) => e.relation === "calls") || [];
+  for (let i = 0; i < queue.length; i++) {
+    const { id, depth } = queue[i];
+    if (depth >= 2) continue;
+    for (const e of calls) {
+      const next = e.from === id ? e.to : e.to === id ? e.from : "";
+      if (next && !ids.has(next) && ids.size < 80) {
+        ids.add(next);
+        queue.push({ id: next, depth: depth + 1 });
+      }
+    }
+  }
+  return snapshot()?.modules.filter((m) => ids.has(m.id)) || [];
+}
+var visibleMapModules = () => (callRoot ? callChainModules() : childModules(mapParent)).filter((m) => !mapQuery || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(mapQuery.toLowerCase()));
+var scopeKey = () => mapParent + (callRoot ? "#calls:" + callRoot : "");
+function rememberMap() {
+  mapLocations.set(scopeKey(), {
+    view: { ...view },
+    selectedModule,
+    arrangeRevision: mapLocations.get(scopeKey())?.arrangeRevision,
+    nodes: new Map(nodePositions),
+    groups: new Map(groupPositions),
+    collapsed: new Set(collapsed),
+    query: mapQuery
+  });
+  if (!layoutKey) return;
+  try {
+    localStorage.setItem(layoutKey, JSON.stringify({ parent: mapParent, callRoot, locations: [...mapLocations].map(([id, l]) => [id, { ...l, nodes: [...l.nodes], groups: [...l.groups], collapsed: [...l.collapsed] }]) }));
+  } catch {
+  }
+}
+function restoreMap() {
+  const key = `nativue-layout:${data?.workspaceId || workspaceTitle()}:${source}`;
+  if (layoutKey === key) return;
+  layoutKey = key;
+  mapLocations.clear();
+  try {
+    const saved = JSON.parse(localStorage.getItem(key) || "null");
+    if (!saved) return;
+    for (const [id, l] of saved.locations) {
+      if (!l.view || ![l.view.x, l.view.y, l.view.scale].every(Number.isFinite)) continue;
+      mapLocations.set(id, { ...l, nodes: new Map(l.nodes), groups: new Map(l.groups), collapsed: new Set(l.collapsed) });
+    }
+    mapParent = moduleById(saved.parent) ? saved.parent : "";
+    callRoot = moduleById(saved.callRoot) ? saved.callRoot : "";
+    const location = mapLocations.get(scopeKey());
+    if (location) {
+      nodePositions.clear();
+      groupPositions.clear();
+      collapsed.clear();
+      for (const [id, p] of location.nodes) nodePositions.set(id, p);
+      for (const [id, p] of location.groups) groupPositions.set(id, p);
+      for (const id of location.collapsed) collapsed.add(id);
+      view = { ...location.view };
+      selectedModule = location.selectedModule;
+      mapQuery = location.query || "";
+      initialFit = true;
+    }
+  } catch {
+    mapLocations.clear();
+  }
+}
+function moduleTrail(id) {
+  const trail = [], seen = /* @__PURE__ */ new Set();
+  let m = moduleById(id);
+  while (m && !seen.has(m.id)) {
+    trail.unshift(m);
+    seen.add(m.id);
+    m = moduleById(m.parentId || "");
+  }
+  return trail;
+}
+function navigateMap(parent, calls = "") {
+  if (parent === mapParent && calls === callRoot) return;
+  rememberMap();
+  mapParent = parent;
+  callRoot = calls;
+  const saved = mapLocations.get(scopeKey());
+  nodePositions.clear();
+  groupPositions.clear();
+  collapsed.clear();
+  for (const [id, p] of saved?.nodes || []) nodePositions.set(id, p);
+  for (const [id, p] of saved?.groups || []) groupPositions.set(id, p);
+  for (const id of saved?.collapsed || []) collapsed.add(id);
+  view = saved ? { ...saved.view } : { x: 0, y: 0, scale: 1 };
+  selectedModule = saved?.selectedModule || calls || parent;
+  mapQuery = saved?.query || "";
+  selectedTask = "";
+  journeyStep = -1;
+  tab = "updates";
+  initialFit = Boolean(saved);
+  render();
+  requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+}
+function renderMapNavigation() {
+  const trail = moduleTrail(mapParent);
+  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "\u67B6\u6784\u5C42\u7EA7")}">${mapParent || callRoot ? `<button id="map-up">\u2190 ${text("Back", "\u8FD4\u56DE\u4E0A\u5C42")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "\u4E3B\u67B6\u6784")}</button>` : `<span aria-current="page">${text("Main architecture", "\u4E3B\u67B6\u6784")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain \xB7 2 hops \xB7 max 80", "\u8C03\u7528\u94FE \xB7 \u4E24\u8DF3 \xB7 \u6700\u591A 80 \u4E2A\u8282\u70B9")}</span></li>` : ""}</ol><span class="map-scope-count">${visibleMapModules().length} ${text("modules", "\u4E2A\u6A21\u5757")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" placeholder="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" value="${esc(mapQuery)}">` : ""}</nav>`;
+}
 var formatDate = (v) => v ? new Date(v).toLocaleString(lang === "zh" ? "zh-CN" : "en-US", {
   month: "short",
   day: "numeric",
@@ -80,12 +257,21 @@ async function api(path, body) {
 }
 async function refresh() {
   try {
-    data = await api("/api/state");
+    const next = await api("/api/state");
+    if (canvasGestureActive) {
+      canvasRenderPending = true;
+      return;
+    }
+    data = next;
     if (!lang) {
       lang = data.config.language;
       localStorage.setItem("nativue-language", lang);
     }
     const s = snapshot();
+    restoreMap();
+    if (mapParent && !moduleById(mapParent)) navigateMap("");
+    if (callRoot && !moduleById(callRoot)) navigateMap(mapParent);
+    if (selectedModule && !moduleById(selectedModule)) selectedModule = "";
     if (selectedFile && !s?.files.some((f) => f.path === selectedFile))
       selectedFile = "";
     related = related.filter((p) => s?.files.some((f) => f.path === p));
@@ -135,6 +321,8 @@ var palettes = [
   ["#eaf4f4", "#dbecec", "#b7d2d2"]
 ];
 function groupTitle(kind) {
+  const custom = data?.config.moduleGroups?.find((g) => g.id === kind);
+  if (custom) return custom.name;
   const titles = {
     frontend: ["Frontend", "\u524D\u7AEF"],
     backend: ["Backend", "\u540E\u7AEF"],
@@ -149,33 +337,78 @@ function groupTitle(kind) {
   };
   return titles[kind] ? text(...titles[kind]) : kind || text("Modules", "\u6A21\u5757");
 }
+var hierarchyCache = /* @__PURE__ */ new WeakMap();
+function hierarchyFor(modules, columns) {
+  const s = snapshot();
+  if (!s || !modules.length || !modules.every((m) => m.generator === "java" && m.level === "class")) return void 0;
+  let cache = hierarchyCache.get(s);
+  if (!cache) hierarchyCache.set(s, cache = /* @__PURE__ */ new Map());
+  const key = JSON.stringify([columns, modules.map((m) => m.id)]);
+  if (!cache.has(key)) cache.set(key, codeHierarchy(modules, s.edges, columns));
+  return cache.get(key);
+}
 function groups() {
   const map = /* @__PURE__ */ new Map();
-  for (const m of snapshot()?.modules || []) {
+  for (const m of visibleMapModules()) {
     const k = m.kind || "source";
     if (!map.has(k)) map.set(k, []);
     map.get(k).push(m);
   }
-  return [...map].map(([id, modules], i) => {
-    const p = groupPositions.get(id) || { x: 60 + i * 420, y: 70 };
-    return {
+  const entries = [...map];
+  const descriptions = new Map(data?.config.moduleGroups?.map((g) => [g.id, g.description]));
+  const columns = mapParent ? Math.max(1, Math.min(entries.length, Math.round(Math.sqrt(entries.length * stageSize.width / stageSize.height)))) : Math.max(1, entries.length);
+  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns || (mapParent ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3)))) : 1));
+  const hierarchies = entries.map(([, modules], i) => hierarchyFor(modules, nodeColumns[i]));
+  const result = [];
+  for (const [i, [id, modules]] of entries.entries()) {
+    let y = 70;
+    for (let row = 0; row < Math.floor(i / columns); row++)
+      y += Math.max(...result.slice(row * columns, (row + 1) * columns).map((g) => g.height)) + 55;
+    const rowStart = Math.floor(i / columns) * columns;
+    const x = 60 + result.slice(rowStart, i).reduce((sum, g) => sum + g.width + 52, 0);
+    const p = groupPositions.get(id) || { x, y, columns: nodeColumns[i] };
+    const positions = modules.flatMap((m) => {
+      const saved = nodePositions.get(m.id);
+      return saved ? [{ x: saved.x - p.x, y: saved.y - p.y }] : [];
+    });
+    const height = collapsed.has(id) ? 108 + (descriptions.get(id) ? 40 : 0) : Math.max(
+      285,
+      130 + (descriptions.get(id) ? 40 : 0) + (hierarchies[i]?.height ?? Math.ceil(modules.length / nodeColumns[i]) * 164),
+      ...positions.map((pos) => pos.y + 164)
+    );
+    const width = Math.max(
+      hierarchies[i] ? hierarchies[i].width + 50 : 368 + (nodeColumns[i] - 1) * 350,
+      ...positions.map((pos) => pos.x + 341)
+    );
+    if (mapParent) groupPositions.set(id, p);
+    result.push({
       id,
       title: groupTitle(id),
-      modules,
+      description: descriptions.get(id),
+      modules: hierarchies[i] ? hierarchies[i].families.flatMap((f) => f.members.map((id2) => modules.find((m) => m.id === id2))) : modules,
       color: palettes[i % palettes.length],
       ...p,
-      width: 368,
-      height: collapsed.has(id) ? 108 : Math.max(285, 130 + modules.length * 164)
-    };
-  });
+      columns: nodeColumns[i],
+      width,
+      height,
+      hierarchy: hierarchies[i]
+    });
+  }
+  return result;
 }
 function nodePos(m, g) {
   g = g || groups().find((gr) => gr.modules.some((n) => n.id === m.id));
   const i = g?.modules.findIndex((n) => n.id === m.id) || 0;
-  return nodePositions.get(m.id) || {
-    x: (g?.x || 0) + 25 + (m.x || 0),
-    y: (g?.y || 0) + 115 + i * 164 + (m.y || 0)
+  const planned = g?.hierarchy?.positions.get(m.id);
+  const position = nodePositions.get(m.id) || {
+    x: (g?.x || 0) + 25 + (planned?.x ?? i % (g?.columns || 1) * 350) + (m.x || 0),
+    y: (g?.y || 0) + 115 + (g?.description ? 40 : 0) + (planned?.y ?? Math.floor(i / (g?.columns || 1)) * 164) + (m.y || 0)
   };
+  if (mapParent && !nodePositions.has(m.id)) {
+    while ([...nodePositions.values()].some((p) => p.x === position.x && p.y === position.y)) position.y += 164;
+    nodePositions.set(m.id, position);
+  }
+  return position;
 }
 function activeModules() {
   if (selectedTask) {
@@ -187,19 +420,44 @@ function activeModules() {
   if (tab === "journeys") {
     const j = currentJourney();
     return new Set(
-      journeyStep >= 0 && j?.steps[journeyStep] ? [j.steps[journeyStep].moduleId] : j?.steps.map((st) => st.moduleId) || []
+      journeyStep >= 0 && j?.steps[journeyStep] ? [j.steps[journeyStep].moduleId] : j?.steps.map(
+        (st) => moduleTrail(st.moduleId).find((m) => (m.parentId || "") === mapParent)?.id || st.moduleId
+      ) || []
     );
   }
-  return new Set(selectedModule ? [selectedModule] : []);
+  const family = groups().flatMap((g) => g.hierarchy?.families || []).find((f) => f.members.includes(selectedModule));
+  return new Set(family?.members || (selectedModule && selectedModule !== mapParent ? [selectedModule] : []));
 }
 function render() {
+  if (canvasGestureActive) {
+    canvasRenderPending = true;
+    return;
+  }
   if (!data) return;
+  const arrangeRevision = data.layoutRequests?.[source]?.[scopeKey()];
+  if (typeof arrangeRevision === "string" && arrangeRevision && mapLocations.get(scopeKey())?.arrangeRevision !== arrangeRevision) {
+    nodePositions.clear();
+    groupPositions.clear();
+    collapsed.clear();
+    mapQuery = "";
+    view = { x: 0, y: 0, scale: 1 };
+    initialFit = false;
+    mapLocations.set(scopeKey(), {
+      arrangeRevision,
+      view: { ...view },
+      selectedModule,
+      nodes: /* @__PURE__ */ new Map(),
+      groups: /* @__PURE__ */ new Map(),
+      collapsed: /* @__PURE__ */ new Set()
+    });
+  }
   const savedScroll = document.querySelector(".sidebar-scroll")?.scrollTop, inspectorScroll = document.querySelector(".parallel-inspector")?.scrollTop;
   const active = document.activeElement;
+  const focusModuleSearch = active?.id === "module-search";
   const focusSearch = active?.id === "file-search", caret = focusSearch ? active.selectionStart : null, focusedTreeFile = active?.dataset.treeFile || "";
   const s = snapshot(), r = data.runtime;
   document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
-  document.title = `Nativue AI \xB7 ${workspaceTitle()}`;
+  document.title = `Tika's Code \xB7 ${workspaceTitle()}`;
   app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "\u5F00\u53D1\u753B\u5E03")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "\u8BF4\u660E\u4E0E\u5BFC\u822A")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "\u8C03\u6574\u53F3\u4FA7\u5BBD\u5EA6")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "\u4EE3\u7801\u4E0E\u8FD0\u884C\u5730\u56FE")}</h1><select id="version-picker" aria-label="${text("View version", "\u67E5\u770B\u7248\u672C")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "\u5F53\u524D\u5DE5\u4F5C\u533A")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "\u8FDC\u7AEF\u5206\u652F")}${data.config.remote.branch ? " \xB7 " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "\u753B\u5E03\u89C6\u56FE")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "\u4EE3\u7801\u5730\u56FE")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "\u66F4\u65B0\u6E90\u7801\u7D22\u5F15")}" ${busy ? "disabled" : ""}>\u21BB</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "\u8BBE\u7F6E")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "\u5207\u6362\u5230\u82F1\u6587")}">${lang === "zh" ? "EN" : "\u4E2D\u6587"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</h2><p class="empty-text">${text("Tasks are grouped by dependency depth, not by status. Click a card for scope, ownership, commits and independent review evidence.", "\u4EFB\u52A1\u6309\u4F9D\u8D56\u5C42\u7EA7\u5206\u7EC4\uFF0C\u4E0D\u6309\u72B6\u6001\u5206\u5217\u3002\u70B9\u51FB\u5361\u7247\u67E5\u770B\u8303\u56F4\u3001\u8BA4\u9886\u3001\u63D0\u4EA4\u548C\u72EC\u7ACB\u9A8C\u6536\u8BC1\u636E\u3002")}</p><button class="primary" id="new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button>${renderTaskDetail(void 0)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "\u67B6\u6784\u8F85\u52A9\u5BFC\u822A")}">${["updates", "journeys", "folders"].map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "\u672C\u6B21\u66F4\u65B0"), text("Journeys", "\u64CD\u4F5C\u65C5\u7A0B"), text("Folders", "\u6587\u4EF6\u5939")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "\u989C\u8272\u3001\u8FDE\u7EBF\u548C\u9A8C\u8BC1\u8FB9\u754C")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "\u5927\u6A21\u5757\u5E95\u8272\u533A\u5206\u7C7B\u522B\u3002\u5B9E\u7EBF\u8868\u793A\u6709\u89C2\u5BDF\u6216\u6838\u5BF9\u4F9D\u636E\u7684\u6E90\u7801\u5173\u7CFB\uFF0C\u70B9\u7EBF\u8868\u793A\u63A8\u65AD\u3002\u6E90\u7801\u5206\u6790\u4E0D\u7B49\u4E8E\u8FD0\u884C\u9A8C\u6536\u3002")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "\u62D6\u52A8\u5361\u7247\u6216\u7EC4\u6807\u9898\uFF1B\u62D6\u52A8\u7A7A\u767D\u5E73\u79FB\uFF0C\u6EDA\u8F6E\u7F29\u653E\u3002\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "\u7248\u672C\u4E0E\u4F7F\u7528\u8BF4\u660E")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "\u5DE5\u4F5C\u533A")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "\u4ECA\u65E5 AI \u8C03\u7528")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "\u5206\u6790")}</button><button id="pause-button">${r.paused ? text("Resume", "\u6062\u590D") : text("Pause", "\u6682\u505C")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "\u540C\u6B65\u8FDC\u7AEF")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI \xB7 ${esc(short(s?.source.commit))}${s?.source.dirty ? " \xB7 " + text("modified", "\u6709\u4FEE\u6539") : ""}</span><button class="subtle" id="help-button">${text("Help", "\u4F7F\u7528\u5E2E\u52A9")}</button></div><span class="attribution">SienGe AI Lab \xB7 \u5C0F\u7EA2\u4E66\uFF1ASienGe\u7684AI\u5B9E\u9A8C\u5BA4</span></footer></aside></main>`;
   bind();
   bindResize();
@@ -211,6 +469,10 @@ function render() {
   if (inspectorScroll !== void 0) {
     const el = document.querySelector(".parallel-inspector");
     if (el) el.scrollTop = inspectorScroll;
+  }
+  if (focusModuleSearch) {
+    const input = document.querySelector("#module-search");
+    input?.focus();
   }
   if (focusSearch) {
     const el = document.querySelector("#file-search");
@@ -245,19 +507,83 @@ function renderNotice() {
     out += `<div class="notice error">${esc(s.analysis.error)}</div>`;
   if (s && s.analysis.status !== "complete")
     out += `<div class="notice">${s.analysis.status === "stale" ? text("Code changed. Showing the last architecture while an update is queued.", "\u4EE3\u7801\u5DF2\u53D8\u5316\uFF0C\u5F53\u524D\u4FDD\u7559\u4E0A\u4E00\u7248\u67B6\u6784\uFF0C\u7B49\u5F85\u589E\u91CF\u5206\u6790\u3002") : text("Source indexed. Architecture explanations are waiting for an Agent.", "\u6E90\u7801\u5DF2\u7D22\u5F15\uFF0C\u67B6\u6784\u8BF4\u660E\u7B49\u5F85 Agent \u5206\u6790\u3002")}<br><button id="notice-analyze">${text("Analyze / create request", "\u5206\u6790 / \u751F\u6210\u8BF7\u6C42")}</button></div>`;
-  return out;
+  return out + renderJavaStatus();
 }
 function renderVersion() {
   const s = snapshot();
   return `<p class="source-version">${text("Source", "\u6765\u6E90")}: ${s?.source.kind === "remote" ? text("Remote", "\u8FDC\u7AEF") : text("Local", "\u672C\u5730")} \xB7 ${esc(s?.source.branch || "\u2014")}<br>${text("Commit", "\u63D0\u4EA4")}: ${esc(s?.source.commit || "\u2014")}<br>${text("Snapshot", "\u5FEB\u7167")}: ${esc(s?.id || "\u2014")}<br>${text("Indexed", "\u7D22\u5F15\u66F4\u65B0")}: ${formatDate(s?.generatedAt)}<br>${text("Semantic update", "\u8BED\u4E49\u66F4\u65B0")}: ${formatDate(s?.analysis.updatedAt)}</p>`;
 }
+function renderJavaStatus() {
+  const j = snapshot()?.java;
+  if (!j) return "";
+  const c = j.changes;
+  return `<details class="java-report" ${j.status === "failed" ? "open" : ""}><summary>${text("Java automatic source graph", "Java \u6E90\u7801\u81EA\u52A8\u5EFA\u56FE")} \xB7 ${j.status === "failed" ? text("Failed \xB7 previous graph retained", "\u5931\u8D25 \xB7 \u4FDD\u7559\u4E0A\u4E00\u6709\u6548\u56FE") : text("Updated", "\u5DF2\u66F4\u65B0")}</summary><p>${text("Parsed / cached / re-resolved files", "\u89E3\u6790 / \u7F13\u5B58\u590D\u7528 / \u5173\u7CFB\u91CD\u7B97\u6587\u4EF6")}: ${j.parsedFiles} / ${j.reusedFiles} / ${j.resolvedFiles}</p><p>${text("Added / changed / removed nodes", "\u65B0\u589E / \u53D8\u5316 / \u5220\u9664\u8282\u70B9")}: ${c.added.length} / ${c.changed.length} / ${c.removed.length}<br>${text("Added / changed / removed relationships", "\u65B0\u589E / \u53D8\u5316 / \u5220\u9664\u5173\u7CFB")}: ${c.addedEdges.length} / ${c.changedEdges.length} / ${c.removedEdges.length}</p>${c.removed.slice(0, 20).map((m) => `<p class="removed-item">\u2212 ${esc(m.name)}</p>`).join("")}${c.removedEdges.slice(0, 20).map((e) => `<p class="removed-item">\u2212 ${esc(e.relation)}: ${esc(e.label)}</p>`).join("")}<p>${text("Unresolved / ambiguous / parser diagnostics", "\u672A\u89E3\u6790 / \u6B67\u4E49 / \u8BED\u6CD5\u8BCA\u65AD")}: ${j.diagnosticCount}</p><div class="java-diagnostics">${j.diagnostics.slice(0, 25).map((d) => `<p><code>${esc(d.path)}:${d.line}</code><br>${esc(d.kind)} \xB7 ${esc(d.message)}</p>`).join("")}</div><p>${text("Feature membership is inferred. Relationships describe declared source targets; reflection, complex call chains and runtime binding remain unresolved.", "\u529F\u80FD\u5F52\u5C5E\u662F\u63A8\u65AD\u3002\u8FDE\u7EBF\u8868\u793A\u6E90\u7801\u58F0\u660E\u76EE\u6807\uFF1B\u53CD\u5C04\u3001\u590D\u6742\u94FE\u5F0F\u8868\u8FBE\u5F0F\u548C\u8FD0\u884C\u65F6\u7ED1\u5B9A\u4ECD\u6709\u89E3\u6790\u8FB9\u754C\u3002")}</p></details>`;
+}
+function mapEdges() {
+  const visible = new Set(visibleMapModules().map((m) => m.id));
+  const lift = (id) => callRoot ? visible.has(id) ? id : void 0 : moduleTrail(id).find((m) => (m.parentId || "") === mapParent)?.id;
+  const projected = /* @__PURE__ */ new Map();
+  const result = [];
+  for (const e of snapshot()?.edges || []) {
+    if (e.generator !== "java") {
+      if (!callRoot) result.push(e);
+      continue;
+    }
+    if (callRoot && e.relation !== "calls") continue;
+    const from = lift(e.from), to = lift(e.to);
+    if (!from || !to || from === to) continue;
+    const key = `${from}:${to}:${e.relation}`;
+    const existing = projected.get(key);
+    if (existing) {
+      existing.count++;
+      existing.edge.evidence = [...existing.edge.evidence, ...e.evidence].slice(0, 8);
+      if (e.confidence === "inferred") existing.edge.confidence = "inferred";
+      if (e.change) existing.edge.change = e.change;
+    } else projected.set(key, { edge: { ...e, from, to }, count: 1 });
+  }
+  return [...result, ...[...projected.values()].map(({ edge, count }) => ({ ...edge, label: edge.label + (count > 1 ? ` \xB7 ${count} ${text("source relationships", "\u6761\u6E90\u7801\u5173\u7CFB")}` : "") }))];
+}
+function typeName(m) {
+  const names = { class: ["Class", "\u7C7B"], interface: ["Interface", "\u63A5\u53E3"], enum: ["Enum", "\u679A\u4E3E"], record: ["Record", "\u8BB0\u5F55\u7C7B"] };
+  return text(...names[m.typeKind || "class"] || names.class);
+}
+function typeRelations(m) {
+  const relations = [];
+  const owner = moduleById(m.declaringTypeId || "");
+  if (owner) relations.push({ target: owner, label: text("Declared in", "\u5185\u90E8\u7C7B\u578B\uFF0C\u5C5E\u4E8E") });
+  for (const edge of snapshot()?.edges || []) {
+    if (edge.from !== m.id || !["implements", "extends"].includes(edge.relation || "")) continue;
+    const target = moduleById(edge.to);
+    if (target) relations.push({ target, label: edge.relation === "implements" ? text("Implements", "\u5B9E\u73B0") : text("Extends", "\u7EE7\u627F") });
+  }
+  return relations;
+}
+function renderTypeBadge(m) {
+  if (m.level !== "class" || m.generator !== "java") return "";
+  const relations = typeRelations(m).map((r) => r.label + " " + r.target.name).join(" \xB7 ");
+  return `<span class="type-relation" title="${esc(relations || m.symbol)}"><strong>${typeName(m)}</strong>${relations ? ` \xB7 ${esc(relations)}` : ""}</span>`;
+}
+function renderTypeFamilies(g) {
+  if (!g.hierarchy || collapsed.has(g.id)) return "";
+  const rects = new Map(g.modules.map((m) => [m.id, { ...nodePos(m, g), width: 316, height: 154 }]));
+  return g.hierarchy.families.filter((f) => f.members.length > 1).map((f) => {
+    const bounds = boundsOf(f.members.map((id) => rects.get(id)), 12);
+    if ([...rects].some(([id, r]) => !f.members.includes(id) && r.x < bounds.x + bounds.width && r.x + r.width > bounds.x && r.y < bounds.y + bounds.height && r.y + r.height > bounds.y)) return "";
+    return `<div class="type-family" data-type-family="${esc(f.root)}" style="left:${bounds.x - g.x}px;top:${bounds.y - g.y - 20}px;width:${bounds.width}px;height:${bounds.height + 20}px"><span>${text("Code hierarchy", "\u4EE3\u7801\u5C42\u7EA7")} \xB7 ${f.members.length} ${text("types", "\u4E2A\u7C7B\u578B")}</span></div>`;
+  }).join("");
+}
+function typeLinkPath(from, to) {
+  const rail = Math.min(from.x, to.x) - 18;
+  return `M ${from.x} ${from.y + 77} H ${rail} V ${to.y + 77} H ${to.x - 4}`;
+}
 function renderMap() {
   const s = snapshot(), gs = groups(), active = activeModules();
-  const visible = (m) => !collapsed.has(m.kind || "source");
+  const visibleIds = new Set(gs.flatMap((g) => g.modules.map((m) => m.id)));
+  const visible = (m) => visibleIds.has(m.id) && !collapsed.has(m.kind || "source");
   const nodes = gs.map(
-    (g, i) => `<section class="group ${collapsed.has(g.id) ? "collapsed" : ""}" data-group-box="${esc(g.id)}" style="left:${g.x}px;top:${g.y}px;width:${g.width}px;height:${g.height}px;--group-bg:${g.color[0]};--group-head:${g.color[1]};--group-line:${g.color[2]}" aria-label="${esc(g.title)}"><div class="group-header"><button class="group-head" data-drag-group="${esc(g.id)}" title="${text("Drag to move group; Alt + arrow keys", "\u62D6\u52A8\u79FB\u52A8\u6574\u7EC4\uFF1BAlt + \u65B9\u5411\u952E\u4E5F\u53EF\u79FB\u52A8")}"><span class="group-no">${String(i + 1).padStart(2, "0")}</span><span class="group-name">${esc(g.title)}</span><span aria-hidden="true">\u283F</span></button><button class="group-toggle" data-group="${esc(g.id)}" aria-label="${text("Expand or collapse", "\u5C55\u5F00\u6216\u6536\u8D77")} ${esc(g.title)}" aria-expanded="${!collapsed.has(g.id)}">${collapsed.has(g.id) ? "\uFF0B" : "\u2212"}</button></div><p class="group-subtitle">${g.modules.length} ${text("modules", "\u4E2A\u6A21\u5757")} \xB7 ${g.modules.reduce((n, m) => n + m.files.length, 0)} ${text("source files", "\u4E2A\u6E90\u6587\u4EF6")}${collapsed.has(g.id) ? " \xB7 " + text("collapsed", "\u5DF2\u6536\u8D77") : ""}</p>${!collapsed.has(g.id) ? g.modules.map((m, j) => {
+    (g, i) => `<section class="group ${collapsed.has(g.id) ? "collapsed" : ""}" data-group-box="${esc(g.id)}" style="left:${g.x}px;top:${g.y}px;width:${g.width}px;height:${g.height}px;--group-bg:${g.color[0]};--group-head:${g.color[1]};--group-line:${g.color[2]}" aria-label="${esc(g.title)}"><div class="group-header"><button class="group-head" data-drag-group="${esc(g.id)}" title="${text("Drag to move group; Alt + arrow keys", "\u62D6\u52A8\u79FB\u52A8\u6574\u7EC4\uFF1BAlt + \u65B9\u5411\u952E\u4E5F\u53EF\u79FB\u52A8")}"><span class="group-no">${String(i + 1).padStart(2, "0")}</span><span class="group-name">${esc(g.title)}</span><span aria-hidden="true">\u283F</span></button><button class="group-toggle" data-group="${esc(g.id)}" aria-label="${text("Expand or collapse", "\u5C55\u5F00\u6216\u6536\u8D77")} ${esc(g.title)}" aria-expanded="${!collapsed.has(g.id)}">${collapsed.has(g.id) ? "\uFF0B" : "\u2212"}</button></div><p class="group-subtitle">${g.modules.length} ${text("modules", "\u4E2A\u6A21\u5757")} \xB7 ${g.modules.reduce((n, m) => n + m.files.length, 0)} ${text("source files", "\u4E2A\u6E90\u6587\u4EF6")}${collapsed.has(g.id) ? " \xB7 " + text("collapsed", "\u5DF2\u6536\u8D77") : ""}</p>${g.description ? `<p class="group-description" title="${esc(g.description)}">${esc(g.description)}</p>` : ""}${!collapsed.has(g.id) ? renderTypeFamilies(g) + g.modules.map((m, j) => {
       const p = nodePos(m, g);
-      return `<button class="node status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? active.has(m.id) ? "highlighted" : "dim" : ""}" data-node="${esc(m.id)}" aria-pressed="${selectedModule === m.id}" title="${text("Drag to move; click for details", "\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E\uFF1B\u70B9\u51FB\u67E5\u770B\u89E3\u91CA")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} \u283F</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${esc(m.name)}</span><span class="node-caption">${esc(m.description || text("Awaiting explanation", "\u7B49\u5F85\u8BF4\u660E"))}</span></button>`;
+      return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? active.has(m.id) ? "highlighted" : "dim" : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childModules(m.id).length ? text("Click for details; double-click to open internal architecture; drag to move", "\u5355\u51FB\u67E5\u770B\u4FE1\u606F\uFF1B\u53CC\u51FB\u8FDB\u5165\u5185\u90E8\u67B6\u6784\uFF1B\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E") : text("Drag to move; click for details", "\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E\uFF1B\u70B9\u51FB\u67E5\u770B\u89E3\u91CA")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} \u283F${childModules(m.id).length ? ` \xB7 \u21B3 ${childModules(m.id).length} ${text("submodules", "\u5B50\u6A21\u5757")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "\u65B0\u589E") : text("Changed", "\u53D8\u5316")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "\u7B49\u5F85\u8BF4\u660E"))}</span></button>`;
     }).join("") : ""}</section>`
   ).join("");
   const rects = gs.map((g) => ({
@@ -267,14 +593,19 @@ function renderMap() {
     height: g.height
   }));
   const bounds = boundsOf(rects, 180);
-  const edges = s?.edges.map((e, i) => {
+  const edges = mapEdges().map((e, i) => {
     const a = moduleById(e.from), b = moduleById(e.to);
     if (!a || !b || !visible(a) || !visible(b)) return "";
     const ar = nodePos(a), br = nodePos(b);
     const focus = active.size > 0 && active.has(e.from) && active.has(e.to) || selectedModule && (e.from === selectedModule || e.to === selectedModule);
-    return `<path class="edge ${e.confidence === "inferred" ? "reference" : ""} ${focus ? "active" : active.size ? "dim" : ""}" d="${edgePath(ar, br, i)}"><title>${esc(e.label)} \xB7 ${esc(confidence(e.confidence))}${e.evidence[0] ? " \xB7 " + esc(e.evidence[0].path) + (e.evidence[0].line ? ":" + e.evidence[0].line : "") : ""}</title></path>`;
+    return `<path data-from="${esc(e.from)}" data-to="${esc(e.to)}" data-route="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? "type" : "edge"}" data-route-index="${i}" data-change="${e.change || ""}" class="edge ${e.confidence === "inferred" ? "reference" : ""} ${focus ? "active" : active.size ? "dim" : ""}" d="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? typeLinkPath(ar, br) : edgePath(ar, br, i)}"><title>${esc(e.label)} \xB7 ${esc(confidence(e.confidence))}${e.evidence[0] ? " \xB7 " + esc(e.evidence[0].path) + (e.evidence[0].line ? ":" + e.evidence[0].line : "") : ""}</title></path>`;
   }).join("") || "";
-  return `<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "\u67B6\u6784\u753B\u5E03\u3002\u62D6\u52A8\u7A7A\u767D\u79FB\u52A8\uFF0C\u6EDA\u8F6E\u7F29\u653E\uFF1B\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "\u8FDC\u7AEF\u4EE3\u7801\u5730\u56FE") : text("Start with your code", "\u4ECE\u4F60\u7684\u4EE3\u7801\u5F00\u59CB")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "\u5F00\u542F\u5E76\u540C\u6B65\u8FDC\u7AEF\u540E\uFF0C\u5373\u53EF\u67E5\u770B\u72EC\u7ACB\u5FEB\u7167\u3002") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "\u8BF7\u8BA9 Agent \u4F7F\u7528 Nativue Skill\uFF0C\u4ECE\u5DF2\u7D22\u5F15\u4EE3\u7801\u5206\u6790\u6A21\u5757\u3001\u6E90\u7801\u8BC1\u636E\u548C\u64CD\u4F5C\u65C5\u7A0B\u3002")}</p><button id="empty-role">${text("Get Agent instructions", "\u83B7\u53D6 Agent \u6307\u4EE4")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "\u8FDE\u7EBF\u56FE\u4F8B")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "\u6E90\u7801\u5173\u7CFB")}</div><div><span class="line-sample reference"></span>${text("Inferred \xB7 needs verification", "\u63A8\u65AD \xB7 \u5F85\u6838\u5B9E")}</div><p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "\u7BAD\u5934\u6307\u5411\u63A5\u6536\u65B9\uFF0C\u6DF1\u8272\u8868\u793A\u5F53\u524D\u9AD8\u4EAE\u3002")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "\u753B\u5E03\u89C6\u91CE")}"><button id="zoom-out" aria-label="${text("Zoom out", "\u7F29\u5C0F")}">\u2212</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "\u653E\u5927")}">\uFF0B</button><span class="divider"></span><button id="fit">${text("Fit all", "\u5168\u56FE")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "\u5B9A\u4F4D\u6240\u9009")}</button><button id="clear">${text("Clear", "\u6E05\u9664\u9AD8\u4EAE")}</button><button id="reset-layout">${text("Reset layout", "\u91CD\u7F6E\u5E03\u5C40")}</button></div></div>`;
+  const containment = gs.flatMap((g) => g.modules).map((m) => {
+    const owner = moduleById(m.declaringTypeId || "");
+    if (!owner || !visible(m) || !visible(owner)) return "";
+    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(nodePos(owner), nodePos(m))}"><title>${esc(owner.name)} \xB7 ${text("contains", "\u5305\u542B\u5185\u90E8\u7C7B\u578B")} ${esc(m.name)}</title></path>`;
+  }).join("");
+  return `${renderMapNavigation()}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "\u67B6\u6784\u753B\u5E03\u3002\u62D6\u52A8\u7A7A\u767D\u79FB\u52A8\uFF0C\u6EDA\u8F6E\u7F29\u653E\uFF1B\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "\u8FDC\u7AEF\u4EE3\u7801\u5730\u56FE") : text("Start with your code", "\u4ECE\u4F60\u7684\u4EE3\u7801\u5F00\u59CB")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "\u5F00\u542F\u5E76\u540C\u6B65\u8FDC\u7AEF\u540E\uFF0C\u5373\u53EF\u67E5\u770B\u72EC\u7ACB\u5FEB\u7167\u3002") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "\u8BF7\u8BA9 Agent \u4F7F\u7528 Nativue Skill\uFF0C\u4ECE\u5DF2\u7D22\u5F15\u4EE3\u7801\u5206\u6790\u6A21\u5757\u3001\u6E90\u7801\u8BC1\u636E\u548C\u64CD\u4F5C\u65C5\u7A0B\u3002")}</p><button id="empty-role">${text("Get Agent instructions", "\u83B7\u53D6 Agent \u6307\u4EE4")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "\u8FDE\u7EBF\u56FE\u4F8B")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "\u6E90\u7801\u5173\u7CFB")}</div><div><span class="line-sample reference"></span>${text("Inferred \xB7 needs verification", "\u63A8\u65AD \xB7 \u5F85\u6838\u5B9E")}</div>${gs.some((g) => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "\u65E0\u7BAD\u5934\u62EC\u7EBF\uFF1A\u5185\u90E8\u7C7B\u578B\u5F52\u5C5E")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "\u7BAD\u5934\u6307\u5411\u63A5\u6536\u65B9\uFF0C\u6DF1\u8272\u8868\u793A\u5F53\u524D\u9AD8\u4EAE\u3002")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "\u753B\u5E03\u89C6\u91CE")}"><button id="zoom-out" aria-label="${text("Zoom out", "\u7F29\u5C0F")}">\u2212</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "\u653E\u5927")}">\uFF0B</button><span class="divider"></span><button id="fit">${text("Fit all", "\u5168\u56FE")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "\u5B9A\u4F4D\u6240\u9009")}</button><button id="clear">${text("Clear", "\u6E05\u9664\u9AD8\u4EAE")}</button>${gs.some((g) => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "\u6309\u6E90\u7801\u5173\u7CFB\u91CD\u65B0\u6392\u5217\u5F53\u524D\u529F\u80FD\u4E0B\u7684\u7C7B\u578B")}">${text("Arrange code hierarchy", "\u6309\u4EE3\u7801\u5C42\u7EA7\u6392\u5217")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "\u91CD\u7F6E\u5E03\u5C40")}</button></div></div>`;
 }
 function boundsOf(rects, padding = 0) {
   if (!rects.length) return { x: 0, y: 0, width: 1e3, height: 700 };
@@ -353,15 +684,27 @@ function renderUpdates() {
 function renderSelectionEmpty() {
   return `<span class="eyebrow">${text("Source-linked explanations", "\u5173\u8054\u6E90\u7801\u7684\u89E3\u91CA")}</span><h2>${text("Select a module or follow a journey", "\u70B9\u6A21\u5757\uFF0C\u6216\u9010\u6B65\u8D70\u4E00\u6B21\u65C5\u7A0B")}</h2><p>${text("Inspect responsibilities, related connections, source evidence, and actual files. Architecture confidence does not replace independent runtime acceptance.", "\u67E5\u770B\u6A21\u5757\u804C\u8D23\u3001\u5173\u8054\u5173\u7CFB\u3001\u6E90\u7801\u8BC1\u636E\u548C\u5B9E\u9645\u6587\u4EF6\u3002\u67B6\u6784\u53EF\u4FE1\u5EA6\u4E0D\u80FD\u4EE3\u66FF\u72EC\u7ACB\u8FD0\u884C\u9A8C\u6536\u3002")}</p>`;
 }
+function renderResponsibility(m) {
+  const manual = m.descriptionOrigin === "manual";
+  const origin = manual ? text("Manually edited \xB7 kept on refresh", "\u624B\u52A8\u7F16\u8F91 \xB7 \u66F4\u65B0\u540E\u4FDD\u7559") : m.descriptionOrigin === "source-comment" ? text("From source comments", "\u6E90\u7801\u6CE8\u91CA\u81EA\u52A8\u586B\u5145") : text("Automatically generated", "\u81EA\u52A8\u751F\u6210");
+  return `<section class="explain-field responsibility"><div class="responsibility-heading"><h3>${text("What it does", "\u5B83\u8D1F\u8D23\u4EC0\u4E48")}</h3><button id="edit-description">${text("Edit", "\u7F16\u8F91")}</button></div><small class="description-origin">${origin}</small><p class="responsibility-text">${esc(m.description || text("No explanation yet.", "\u5C1A\u65E0\u8BF4\u660E\u3002"))}</p>${manual ? `<details><summary>${text("Latest automatic content", "\u6700\u65B0\u81EA\u52A8\u5185\u5BB9")}</summary><p class="responsibility-text">${esc(m.automaticDescription || text("No automatic explanation yet.", "\u6682\u65E0\u81EA\u52A8\u8BF4\u660E\u3002"))}</p></details>` : ""}${(m.descriptionEvidence || []).map((e) => `<button class="source-link comment-evidence" data-file="${esc(e.path)}"><code>${esc(e.path)}:${e.line}</code><span>${text("Automatic content source", "\u81EA\u52A8\u5185\u5BB9\u6765\u6E90")} \u2197</span></button>`).join("")}</section>`;
+}
+function renderFeatureSettings(m) {
+  if (m.generator !== "java") return "";
+  if (m.level === "feature") return `<section class="explain-field feature-settings"><div class="responsibility-heading"><h3>${text("Feature name", "\u529F\u80FD\u540D\u79F0")}</h3><button id="edit-feature-name">${text("Rename", "\u91CD\u547D\u540D")}</button></div><p>${esc(m.name)}</p><small class="description-origin">${m.nameOrigin === "manual" ? text("Manually named \xB7 kept on refresh", "\u624B\u52A8\u547D\u540D \xB7 \u66F4\u65B0\u540E\u4FDD\u7559") : text("Automatically identified", "\u81EA\u52A8\u8BC6\u522B")}${m.automaticName !== void 0 ? `<br>${text("Automatic name", "\u81EA\u52A8\u8BC6\u522B\u540D\u79F0")}: ${esc(m.automaticName)}` : ""}</small></section>`;
+  if (m.level !== "class") return "";
+  const parent = moduleById(m.parentId || ""), automatic = moduleById(m.automaticParentId || m.parentId || "");
+  return `<section class="explain-field feature-settings"><div class="responsibility-heading"><h3>${text("Feature membership", "\u529F\u80FD\u5F52\u5C5E")}</h3><button id="edit-class-feature">${text("Change feature", "\u8C03\u6574\u5F52\u5C5E")}</button></div><p>${esc(parent?.name || text("Unassigned", "\u672A\u5F52\u5C5E"))}</p><small class="description-origin">${m.parentOrigin === "manual" ? text("Manually assigned \xB7 kept on refresh", "\u624B\u52A8\u6307\u5B9A \xB7 \u66F4\u65B0\u540E\u4FDD\u7559") : text("Automatically identified", "\u81EA\u52A8\u8BC6\u522B")}${m.parentOrigin === "manual" ? `<br>${text("Automatic feature", "\u81EA\u52A8\u8BC6\u522B\u5F52\u5C5E")}: ${esc(automatic?.name || text("Unavailable", "\u6682\u65E0"))}` : ""}${m.pendingParentId ? `<br>${text("Saved target is unavailable; showing the automatic feature. Your setting is retained.", "\u624B\u52A8\u76EE\u6807\u529F\u80FD\u5DF2\u4E0D\u5B58\u5728\uFF0C\u6682\u7528\u81EA\u52A8\u5F52\u5C5E\uFF1B\u539F\u8BBE\u7F6E\u4ECD\u4FDD\u7559\u3002")}` : ""}</small></section>`;
+}
 function renderModuleDetail(m) {
   if (!m) return renderSelectionEmpty();
-  return `<span class="eyebrow">${esc(groupTitle(m.kind))} / ${text("module", "\u5C0F\u6A21\u5757")}</span><h2>${esc(m.name)}</h2><span class="status-tag status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"}">${esc(confidence(m.confidence))}</span><section class="explain-field"><h3>${text("What it does", "\u5B83\u8D1F\u8D23\u4EC0\u4E48")}</h3><p>${esc(m.description || text("No explanation yet.", "\u5C1A\u65E0\u8BF4\u660E\u3002"))}</p></section><section class="explain-field"><h3>${text("What its connections carry", "\u76F8\u5173\u8FDE\u7EBF\u4F20\u7684\u662F\u4EC0\u4E48")}</h3>${snapshot()?.edges.filter((e) => e.from === m.id || e.to === m.id).map(
-    (e) => `<button class="connection-item" data-edge="${esc(e.id)}">${esc(moduleById(e.from)?.name || e.from)} \u2192 ${esc(moduleById(e.to)?.name || e.to)}<small>${esc(e.label)} \xB7 ${esc(confidence(e.confidence))}</small></button>`
+  return `<span class="eyebrow">${esc(groupTitle(m.kind))} / ${esc(m.level || text("module", "\u5C0F\u6A21\u5757"))}</span><h2>${esc(m.name)}</h2>${m.level === "method" ? `<button id="show-call-chain">${text("Explore call chain", "\u67E5\u770B\u8C03\u7528\u94FE")} \u2192</button>` : ""}${childModules(m.id).length && mapParent !== m.id ? `<button id="enter-module">${text("Open internal architecture", "\u8FDB\u5165\u5185\u90E8\u67B6\u6784")} \u2192</button>` : ""}<span class="status-tag status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"}">${esc(confidence(m.confidence))}</span>${renderFeatureSettings(m)}${m.level === "class" && typeRelations(m).length ? `<section class="explain-field type-relationships"><h3>${text("Code hierarchy", "\u4EE3\u7801\u5C42\u7EA7")}</h3>${typeRelations(m).map((r) => `<button class="source-link" data-symbol-target="${esc(r.target.id)}">${esc(r.label)} \xB7 ${esc(r.target.name)} \u2192</button>`).join("")}</section>` : ""}${renderResponsibility(m)}<section class="explain-field"><h3>${text("What its connections carry", "\u76F8\u5173\u8FDE\u7EBF\u4F20\u7684\u662F\u4EC0\u4E48")}</h3>${snapshot()?.edges.filter((e) => e.from === m.id || e.to === m.id).map(
+    (e) => `<button class="connection-item" data-edge="${esc(e.id)}">${esc(moduleById(e.from)?.name || e.from)} \u2192 ${esc(moduleById(e.to)?.name || e.to)}<small>${esc(e.label)} \xB7 ${esc(confidence(e.confidence))}</small></button>${e.generator === "java" ? `<button class="symbol-target" data-symbol-target="${esc(e.from === m.id ? e.to : e.from)}">${text("Go to related declaration", "\u8F6C\u5230\u5173\u8054\u58F0\u660E")} \u2192</button>` : ""}`
   ).join("") || `<p>${text("No relationships recorded.", "\u6682\u65E0\u5DF2\u8BB0\u5F55\u5173\u7CFB\u3002")}</p>`}</section><section class="explain-field"><h3>${text("Source files & navigation", "\u6E90\u6587\u4EF6\u4E0E\u5B9A\u4F4D")}</h3><button id="show-selected-files">${text(`Locate ${m.files.length} related files in the tree`, `\u5728\u6587\u4EF6\u6811\u4E2D\u67E5\u770B ${m.files.length} \u4E2A\u76F8\u5173\u6587\u4EF6`)}</button>${m.evidence.map((e) => `<button class="source-link" data-file="${esc(e.path)}"><code>${esc(e.path)}${e.line ? ":" + e.line : ""}</code><span>${esc(e.note || text("Locate source file", "\u5B9A\u4F4D\u6E90\u6587\u4EF6"))} \u2197</span></button>`).join("")}${!m.evidence.length ? `<p class="fine">${text("No line-level evidence supplied.", "\u5C1A\u672A\u63D0\u4F9B\u884C\u7EA7\u6E90\u7801\u8BC1\u636E\u3002")}</p>` : ""}</section>`;
 }
 function currentJourney() {
   const list = snapshot()?.journeys || [];
-  return list.find((j) => j.id === selectedJourney) || list[0];
+  return list.find((j) => j.id === selectedJourney) || (mapParent ? list.find((j) => j.steps.some((step) => moduleTrail(step.moduleId).some((m) => m.id === mapParent))) : void 0) || list[0];
 }
 function renderJourneyNav() {
   const j = currentJourney();
@@ -421,7 +764,7 @@ function renderTaskDetail(t) {
     [text("Integration commit", "\u96C6\u6210\u63D0\u4EA4"), t.integrationCommit || "\u2014"]
   ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join(
     ""
-  )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Claimed files", "\u8BA4\u9886\u6587\u4EF6")}</div>${t.files.map((p) => `<button class="evidence" data-file="${esc(p)}">${esc(p)}</button>`).join("") || "\u2014"}<div class="section-label">${text("Review evidence", "\u9A8C\u6536\u8BC1\u636E")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C \u9A8C\u6536")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "\u5C1A\u65E0\u72EC\u7ACB\u9A8C\u6536\u8BB0\u5F55\u3002")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "\u96C6\u6210\u9A8C\u6536")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "\u7528\u6237\u786E\u8BA4")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "\u590D\u5236")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "\u7F16\u8F91 / \u63D0\u4EA4\u4EA4\u63A5\u8BB0\u5F55")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "\u9A8C\u6536\u5FC5\u987B\u7ED1\u5B9A\u5B9E\u9645\u63D0\u4EA4\u3002\u53EA\u6709\u7528\u6237\u80FD\u786E\u8BA4\u624B\u6D4B\u901A\u8FC7\u3002")}</p>`;
+  )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "\u9A8C\u6536\u8BC1\u636E")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C \u9A8C\u6536")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "\u5C1A\u65E0\u72EC\u7ACB\u9A8C\u6536\u8BB0\u5F55\u3002")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "\u96C6\u6210\u9A8C\u6536")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "\u7528\u6237\u786E\u8BA4")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "\u590D\u5236")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "\u7F16\u8F91 / \u63D0\u4EA4\u4EA4\u63A5\u8BB0\u5F55")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "\u9A8C\u6536\u5FC5\u987B\u7ED1\u5B9A\u5B9E\u9645\u63D0\u4EA4\u3002\u53EA\u6709\u7528\u6237\u80FD\u786E\u8BA4\u624B\u6D4B\u901A\u8FC7\u3002")}</p>`;
 }
 function locateFile(path, files) {
   if (!snapshot()?.files.some((file) => file.path === path)) {
@@ -457,14 +800,17 @@ function stepFile(delta) {
 function selectModule(id, fromJourney = false) {
   selectedModule = id;
   selectedTask = "";
+  if (tab === "folders") tab = "updates";
   const m = moduleById(id);
   if (m) collapsed.delete(m.kind || "source");
   if (!fromJourney) journeyStep = -1;
+  const viewport = document.getElementById("viewport");
+  view.x -= viewport?.scrollLeft || 0;
+  view.y -= viewport?.scrollTop || 0;
   render();
-  if (tab !== "folders")
-    requestAnimationFrame(
-      () => document.querySelector("#selection")?.scrollIntoView({ block: "start", behavior: "smooth" })
-    );
+  requestAnimationFrame(
+    () => document.querySelector("#selection")?.scrollIntoView({ block: "start", behavior: "smooth" })
+  );
 }
 function selectTask(id) {
   selectedTask = id;
@@ -484,6 +830,13 @@ function selectTask(id) {
 function showJourney(index) {
   const j = currentJourney();
   if (!j) return;
+  selectedJourney = j.id;
+  const nextStep = j.steps[index];
+  const trails = j.steps.map((step) => moduleTrail(step.moduleId).slice(0, -1));
+  const common = trails[0]?.filter((m) => trails.every((trail) => trail.some((n) => n.id === m.id))).at(-1)?.id || "";
+  const parent = nextStep ? moduleById(nextStep.moduleId)?.parentId || "" : common;
+  navigateMap(parent);
+  tab = "journeys";
   journeyStep = Math.max(-1, Math.min(j.steps.length - 1, index));
   selectedTask = "";
   selectedModule = journeyStep >= 0 ? j.steps[journeyStep].moduleId : "";
@@ -497,6 +850,30 @@ function showJourney(index) {
 }
 function bind() {
   const on = (id, fn) => document.getElementById(id)?.addEventListener("click", fn);
+  on("map-up", () => navigateMap(callRoot ? mapParent : moduleById(mapParent)?.parentId || ""));
+  on("show-call-chain", () => navigateMap(mapParent, selectedModule));
+  document.querySelectorAll("[data-symbol-target]").forEach(
+    (el) => el.addEventListener("click", () => {
+      const id = el.dataset.symbolTarget, m = moduleById(id);
+      if (!m) return;
+      navigateMap(m.parentId || "");
+      selectedModule = id;
+      render();
+      focusModule(id);
+    })
+  );
+  on("enter-module", () => navigateMap(selectedModule));
+  on("edit-description", openDescriptionEditor);
+  on("edit-feature-name", () => openArchitectureEditor("name"));
+  on("edit-class-feature", () => openArchitectureEditor("parentId"));
+  document.querySelectorAll("[data-map-scope]").forEach(
+    (el) => el.addEventListener("click", () => navigateMap(el.dataset.mapScope))
+  );
+  document.querySelector("#module-search")?.addEventListener("input", (e) => {
+    mapQuery = e.target.value;
+    render();
+    if (mapQuery) fitGraph();
+  });
   on("language-button", () => {
     lang = lang === "zh" ? "en" : "zh";
     localStorage.setItem("nativue-language", lang);
@@ -564,6 +941,14 @@ function bind() {
     related = [];
     render();
   });
+  on("arrange-code", () => {
+    mapQuery = "";
+    nodePositions.clear();
+    groupPositions.clear();
+    collapsed.clear();
+    render();
+    fitGraph();
+  });
   on("reset-layout", () => {
     nodePositions.clear();
     groupPositions.clear();
@@ -597,6 +982,10 @@ function bind() {
   });
   document.querySelector("#version-picker")?.addEventListener("change", (e) => {
     source = e.target.value;
+    mapParent = "";
+    callRoot = "";
+    layoutKey = "";
+    mapLocations.clear();
     selectedModule = "";
     selectedFile = "";
     selectedJourney = "";
@@ -605,6 +994,7 @@ function bind() {
     groupPositions.clear();
     initialFit = false;
     view = { x: 0, y: 0, scale: 1 };
+    restoreMap();
     render();
   });
   document.querySelector("#journey-picker")?.addEventListener("change", (e) => {
@@ -697,7 +1087,8 @@ function zoom(factor, x, y, board = false) {
   else view = next;
   paintView(board);
 }
-function paintView(board = false) {
+function paintView(board = false, persist = true) {
+  if (!board && persist) rememberMap();
   const v = board ? boardView : view, world = document.getElementById(board ? "parallel-groups" : "world"), vp = document.getElementById(board ? "parallel-viewport" : "viewport");
   if (world)
     world.style.transform = `translate(${v.x}px,${v.y}px) scale(${v.scale})`;
@@ -718,7 +1109,7 @@ function fitGraph() {
         (g) => collapsed.has(g.id) ? [] : g.modules.map((m) => ({
           ...nodePos(m, g),
           width: 316,
-          height: 124
+          height: g.hierarchy ? 154 : 124
         }))
       )
     ],
@@ -739,8 +1130,15 @@ function fitBoard() {
   paintView(true);
 }
 function focusModule(id) {
+  const target = moduleById(id);
+  if (target && target.id !== mapParent && !callRoot)
+    navigateMap(target.parentId || "");
   const m = moduleById(id), vp = document.getElementById("viewport");
   if (!m || !vp) return;
+  if (id === mapParent) {
+    fitGraph();
+    return;
+  }
   collapsed.delete(m.kind || "source");
   const p = nodePos(m);
   view = fitView(
@@ -759,79 +1157,151 @@ function moveGroup(id, dx, dy) {
     const p = nodePos(m, g);
     nodePositions.set(m.id, { x: p.x + dx, y: p.y + dy });
   }
-  groupPositions.set(id, { x: g.x + dx, y: g.y + dy });
+  groupPositions.set(id, { x: g.x + dx, y: g.y + dy, columns: g.columns });
 }
+var lastNodeClick = null;
 function bindCanvas(board = false) {
   const vp = document.getElementById(board ? "parallel-viewport" : "viewport");
   if (!vp) return;
   stageSize = { width: vp.clientWidth, height: vp.clientHeight };
-  let drag = null;
+  let drag = null, frame = 0;
+  const drawDrag = () => {
+    frame = 0;
+    const d = drag;
+    if (!d?.moved) return;
+    const dx = d.x - d.startX, dy = d.y - d.startY;
+    if (d.type === "pan") {
+      const current = board ? boardView : view;
+      current.x = d.origin.x + dx;
+      current.y = d.origin.y + dy;
+      paintView(board, false);
+    } else {
+      const mx = dx / d.origin.scale, my = dy / d.origin.scale;
+      if (d.element) d.element.style.transform = `translate(${mx}px,${my}px)`;
+      const position = (id) => {
+        const p = d.points.get(id);
+        return d.affected.has(id) ? { x: p.x + mx, y: p.y + my } : p;
+      };
+      for (const p of d.paths) p.element.setAttribute("d", p.type ? typeLinkPath(position(p.from), position(p.to)) : edgePath(position(p.from), position(p.to), p.index));
+    }
+  };
+  const finishDrag = (cancelled = false, ev) => {
+    const d = drag;
+    if (!d) return;
+    if (frame) cancelAnimationFrame(frame);
+    frame = 0;
+    if (ev && !cancelled) {
+      d.x = ev.clientX;
+      d.y = ev.clientY;
+    }
+    if (cancelled) {
+      if (board) boardView = { ...d.origin };
+      else view = { ...d.origin };
+    } else if (d.moved) {
+      drawDrag();
+      if (d.type !== "pan") {
+        const dx = (d.x - d.startX) / d.origin.scale, dy = (d.y - d.startY) / d.origin.scale;
+        for (const { group: g, positions } of d.layout) {
+          groupPositions.set(g.id, { x: g.x, y: g.y, columns: g.columns });
+          for (const [id, p] of positions) nodePositions.set(
+            id,
+            d.affected.has(id) ? { x: p.x + dx, y: p.y + dy } : p
+          );
+        }
+        if (d.type === "group") {
+          const g = d.layout.find((l) => l.group.id === d.id).group;
+          groupPositions.set(d.id, { x: g.x + dx, y: g.y + dy, columns: g.columns });
+        }
+      }
+    }
+    drag = null;
+    canvasGestureActive = false;
+    vp.classList.remove("is-dragging", "is-dragging-node");
+    window.removeEventListener("blur", cancelDrag);
+    if (vp.hasPointerCapture(d.pointerId)) vp.releasePointerCapture(d.pointerId);
+    const pending = canvasRenderPending;
+    canvasRenderPending = false;
+    if (!cancelled && d.type === "node" && !d.moved && ev) {
+      const scope = source + ":" + scopeKey();
+      const doubleClick = lastNodeClick?.id === d.id && lastNodeClick.scope === scope && ev.timeStamp - lastNodeClick.at <= 500 && Math.hypot(ev.clientX - lastNodeClick.x, ev.clientY - lastNodeClick.y) <= 8;
+      lastNodeClick = doubleClick ? null : { id: d.id, scope, at: ev.timeStamp, x: ev.clientX, y: ev.clientY };
+      if (doubleClick && childModules(d.id).length) navigateMap(d.id);
+      selectModule(d.id);
+    } else {
+      lastNodeClick = null;
+      if (cancelled || d.type !== "pan" || pending) render();
+      else paintView(board);
+    }
+    if (pending) void refresh();
+  };
+  const cancelDrag = () => finishDrag(true);
   vp.addEventListener("pointerdown", (ev) => {
-    if (ev.button !== 0 || ev.target.closest("[data-group],.map-empty"))
-      return;
+    if (drag || ev.button !== 0 || !ev.isPrimary || ev.target.closest("[data-group],.map-empty")) return;
     const node = ev.target.closest("[data-node]"), group = ev.target.closest("[data-drag-group]");
     if (board && ev.target.closest("button")) return;
+    if (!node) lastNodeClick = null;
     const current = board ? boardView : view;
+    current.x -= vp.scrollLeft;
+    current.y -= vp.scrollTop;
+    vp.scrollLeft = 0;
+    vp.scrollTop = 0;
+    paintView(board, false);
+    const layout = node || group ? groups().map((g) => ({
+      group: g,
+      positions: new Map(g.modules.map((m) => [m.id, { ...nodePos(m, g) }]))
+    })) : [];
+    const points = new Map(layout.flatMap((l) => [...l.positions]));
+    const affected = new Set(node ? [node.dataset.node] : layout.find((l) => l.group.id === group?.dataset.dragGroup)?.group.modules.map((m) => m.id) || []);
+    const paths = [...vp.querySelectorAll("path.edge,path.containment")].map((element) => ({
+      element,
+      from: element.dataset.from || element.dataset.owner || "",
+      to: element.dataset.to || element.dataset.member || "",
+      type: element.classList.contains("containment") || element.dataset.route === "type",
+      index: Number(element.dataset.routeIndex || 0)
+    })).filter((p) => points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to)));
     drag = {
       type: node ? "node" : group ? "group" : "pan",
       id: node?.dataset.node || group?.dataset.dragGroup || "",
+      pointerId: ev.pointerId,
       startX: ev.clientX,
       startY: ev.clientY,
-      lastX: ev.clientX,
-      lastY: ev.clientY,
-      ox: current.x,
-      oy: current.y,
-      moved: false
+      x: ev.clientX,
+      y: ev.clientY,
+      origin: { ...current },
+      moved: false,
+      layout,
+      points,
+      affected,
+      element: node || group?.closest("[data-group-box]") || null,
+      paths
     };
+    canvasGestureActive = true;
+    window.addEventListener("blur", cancelDrag);
+    vp.focus({ preventScroll: true });
     vp.setPointerCapture(ev.pointerId);
     ev.preventDefault();
   });
   vp.addEventListener("pointermove", (ev) => {
-    if (!drag) return;
-    const dx = ev.clientX - drag.startX, dy = ev.clientY - drag.startY;
-    if (Math.abs(dx) + Math.abs(dy) > 4) drag.moved = true;
-    const current = board ? boardView : view;
-    if (drag.type === "pan") {
-      current.x = drag.ox + dx;
-      current.y = drag.oy + dy;
-      paintView(board);
-    } else {
-      const mx = (ev.clientX - drag.lastX) / current.scale, my = (ev.clientY - drag.lastY) / current.scale;
-      if (drag.type === "group") moveGroup(drag.id, mx, my);
-      else {
-        const m = moduleById(drag.id);
-        if (m) {
-          const p = nodePos(m);
-          nodePositions.set(m.id, { x: p.x + mx, y: p.y + my });
-        }
-      }
-      drag.lastX = ev.clientX;
-      drag.lastY = ev.clientY;
-      const shell = document.querySelector(".canvas-shell");
-      if (shell) {
-        const scratch = document.createElement("div");
-        scratch.innerHTML = renderMap();
-        const incoming = scratch.querySelector("#world"), existing = document.getElementById("world");
-        if (incoming && existing) existing.innerHTML = incoming.innerHTML;
-      }
-    }
+    if (!drag || drag.pointerId !== ev.pointerId) return;
+    drag.x = ev.clientX;
+    drag.y = ev.clientY;
+    if (!drag.moved && Math.hypot(drag.x - drag.startX, drag.y - drag.startY) <= 4) return;
+    drag.moved = true;
+    lastNodeClick = null;
+    vp.classList.add("is-dragging");
+    if (drag.type === "node") vp.classList.add("is-dragging-node");
+    if (!frame) frame = requestAnimationFrame(drawDrag);
   });
   vp.addEventListener("pointerup", (ev) => {
-    if (!drag) return;
-    const d = drag;
-    drag = null;
-    if (vp.hasPointerCapture(ev.pointerId))
-      vp.releasePointerCapture(ev.pointerId);
-    if (d.type === "node" && !d.moved) selectModule(d.id);
-    else if (d.type !== "pan") render();
+    if (drag?.pointerId === ev.pointerId) finishDrag(false, ev);
   });
-  vp.addEventListener("pointercancel", () => {
-    drag = null;
-  });
+  vp.addEventListener("pointercancel", cancelDrag);
+  vp.addEventListener("lostpointercapture", cancelDrag);
   vp.addEventListener(
     "wheel",
     (ev) => {
       ev.preventDefault();
+      if (drag) return;
       const rect = vp.getBoundingClientRect(), delta = ev.deltaY * (ev.deltaMode === 1 ? 16 : ev.deltaMode === 2 ? vp.clientHeight : 1);
       zoom(
         Math.exp(-Math.max(-100, Math.min(100, delta)) * 25e-4),
@@ -843,6 +1313,11 @@ function bindCanvas(board = false) {
     { passive: false }
   );
   vp.addEventListener("keydown", (ev) => {
+    if (drag) {
+      ev.preventDefault();
+      if (ev.key === "Escape") cancelDrag();
+      return;
+    }
     if (ev.altKey && !board) {
       const node = ev.target.closest("[data-node]"), group = ev.target.closest(
         "[data-drag-group]"
@@ -904,7 +1379,10 @@ function bindCanvas(board = false) {
   if (!board) {
     document.querySelectorAll("[data-node]").forEach(
       (el) => el.addEventListener("click", (e) => {
-        if (e.detail === 0) selectModule(el.dataset.node);
+        if (e.detail === 0) {
+          lastNodeClick = null;
+          selectModule(el.dataset.node);
+        }
       })
     );
   }
@@ -994,6 +1472,85 @@ function closeModal() {
   modalCleanup = void 0;
   document.querySelector(".modal-backdrop")?.remove();
   modal = "";
+}
+function openArchitectureEditor(field) {
+  const m = moduleById(selectedModule);
+  if (!m || !data) return;
+  const revision = data.architectureRevision || 0, editSource = source;
+  const naming = field === "name";
+  const autoParent = moduleById(m.automaticParentId || m.parentId || "");
+  const choices = snapshot().modules.filter((n) => n.generator === "java" && n.level === "feature" && n.parentId === autoParent?.parentId);
+  const isManual = naming ? m.nameOrigin === "manual" : m.parentOrigin === "manual" || !!m.pendingParentId;
+  const automatic = naming ? m.automaticName ?? m.name : autoParent?.name || text("Unavailable", "\u6682\u65E0\u81EA\u52A8\u5F52\u5C5E");
+  const shell = openModal(
+    naming ? text("Rename feature", "\u4FEE\u6539\u529F\u80FD\u540D\u79F0") : text("Change class feature", "\u8C03\u6574\u7C7B\u7684\u529F\u80FD\u5F52\u5C5E"),
+    `<form id="architecture-form"><p>${esc(m.symbol || m.name)}</p><p class="fine">${text("Your setting survives analysis refreshes. You can restore the latest automatic result independently.", "\u624B\u52A8\u8BBE\u7F6E\u5728\u91CD\u65B0\u5206\u6790\u540E\u4FDD\u7559\uFF0C\u53EF\u4EE5\u5355\u72EC\u6062\u590D\u5230\u6700\u65B0\u81EA\u52A8\u7ED3\u679C\u3002")}</p><div class="form-row"><label for="architecture-value">${naming ? text("Feature name", "\u529F\u80FD\u540D\u79F0") : text("Target feature", "\u76EE\u6807\u529F\u80FD")}</label>${naming ? `<input id="architecture-value" name="value" required maxlength="100" value="${esc(m.name)}">` : `<select id="architecture-value" name="value">${choices.map((n) => `<option value="${esc(n.id)}" ${n.id === m.parentId ? "selected" : ""}>${esc(n.name)}</option>`).join("")}</select>`}</div><p class="fine">${text("Latest automatic result", "\u6700\u65B0\u81EA\u52A8\u8BC6\u522B\u7ED3\u679C")}: ${esc(automatic)}</p><p id="architecture-error" role="alert" class="description danger"></p><div class="form-actions"><button type="button" id="cancel-architecture">${text("Cancel", "\u53D6\u6D88")}</button>${isManual ? `<button type="button" id="reset-architecture">${text("Restore automatic result", "\u6062\u590D\u81EA\u52A8\u8BC6\u522B")}</button>` : ""}<button class="primary" type="submit">${text("Save", "\u4FDD\u5B58")}</button></div></form>`
+  );
+  let saving = false;
+  const submit = async (value) => {
+    if (saving) return;
+    saving = true;
+    shell.querySelectorAll(".form-actions button").forEach((b) => b.disabled = true);
+    try {
+      await api("/api/architecture-edits", { source: editSource, moduleId: m.id, field, value, revision });
+      closeModal();
+      await refresh();
+      if (!naming && source === editSource) {
+        const updated = moduleById(m.id);
+        if (updated) {
+          navigateMap(updated.parentId || "");
+          selectedModule = updated.id;
+          render();
+          focusModule(updated.id);
+        }
+      }
+      toast(value === null ? text("Automatic result restored.", "\u5DF2\u6062\u590D\u81EA\u52A8\u8BC6\u522B\u7ED3\u679C\u3002") : text("Feature setting saved.", "\u529F\u80FD\u8BBE\u7F6E\u5DF2\u4FDD\u5B58\u3002"));
+    } catch (e) {
+      shell.querySelector("#architecture-error").textContent = String(e);
+    } finally {
+      saving = false;
+      shell.querySelectorAll(".form-actions button").forEach((b) => b.disabled = false);
+    }
+  };
+  shell.querySelector("#architecture-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    void submit(shell.querySelector("#architecture-value").value);
+  });
+  shell.querySelector("#cancel-architecture").addEventListener("click", closeModal);
+  shell.querySelector("#reset-architecture")?.addEventListener("click", () => void submit(null));
+}
+function openDescriptionEditor() {
+  const m = moduleById(selectedModule);
+  if (!m || !data) return;
+  const revision = data.descriptionRevision || 0, editSource = source;
+  const automatic = m.automaticDescription ?? m.description;
+  const shell = openModal(
+    text("Edit responsibility", "\u7F16\u8F91\u804C\u8D23\u8BF4\u660E"),
+    `<form id="description-form"><p>${esc(m.name)}</p><p class="fine">${text("Your edit is kept when source analysis refreshes. Restore automatic content to use the latest source explanation.", "\u624B\u52A8\u4FEE\u6539\u5728\u91CD\u65B0\u5206\u6790\u540E\u4FDD\u7559\u3002\u6062\u590D\u81EA\u52A8\u5185\u5BB9\u540E\uFF0C\u5C06\u4F7F\u7528\u6700\u65B0\u7684\u6E90\u7801\u8BF4\u660E\u3002")}</p><div class="form-row"><label for="description-text">${text("What it does", "\u5B83\u8D1F\u8D23\u4EC0\u4E48")}</label><textarea id="description-text" name="description" maxlength="12000" rows="8">${esc(m.description)}</textarea></div><details><summary>${text("Latest automatic content", "\u6700\u65B0\u81EA\u52A8\u5185\u5BB9")}</summary><p class="responsibility-text">${esc(automatic)}</p></details><p id="description-error" role="alert" class="description danger"></p><div class="form-actions"><button type="button" id="cancel-description">${text("Cancel", "\u53D6\u6D88")}</button>${m.descriptionOrigin === "manual" ? `<button type="button" id="reset-description">${text("Restore automatic content", "\u6062\u590D\u81EA\u52A8\u5185\u5BB9")}</button>` : ""}<button class="primary" type="submit">${text("Save", "\u4FDD\u5B58")}</button></div></form>`
+  );
+  let saving = false;
+  const submit = async (description) => {
+    if (saving) return;
+    saving = true;
+    shell.querySelectorAll(".form-actions button").forEach((b) => b.disabled = true);
+    try {
+      await api("/api/descriptions", { source: editSource, moduleId: m.id, revision, description });
+      closeModal();
+      await refresh();
+      toast(description === null ? text("Automatic content restored.", "\u5DF2\u6062\u590D\u81EA\u52A8\u5185\u5BB9\u3002") : text("Responsibility saved.", "\u804C\u8D23\u8BF4\u660E\u5DF2\u4FDD\u5B58\u3002"));
+    } catch (e) {
+      shell.querySelector("#description-error").textContent = String(e);
+    } finally {
+      saving = false;
+      shell.querySelectorAll(".form-actions button").forEach((b) => b.disabled = false);
+    }
+  };
+  shell.querySelector("#description-form").addEventListener("submit", (e) => {
+    e.preventDefault();
+    void submit(shell.querySelector("#description-text").value);
+  });
+  shell.querySelector("#cancel-description").addEventListener("click", closeModal);
+  shell.querySelector("#reset-description")?.addEventListener("click", () => void submit(null));
 }
 function openSettings() {
   if (!data) return;

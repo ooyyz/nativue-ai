@@ -81,9 +81,16 @@ async function git(root: string, args: string[]): Promise<string> {
     )
   ).stdout;
 }
-function allowed(file: string, extra: string[] = []): boolean {
+function allowed(file: string, extra: string[] = [], javaRoots: string[] = [], directory = false): boolean {
+  const sourceRoot = /(?:^|\/)src\/main\/java\//.exec(file);
+  const packageStart = sourceRoot ? file.slice(0, sourceRoot.index + sourceRoot[0].length).split("/").length - 1 : Infinity;
+  // Selected Java packages named runtime/build are source, not runtime data or build output.
+  const selectedSource = sourceRoot && (directory || file.endsWith(".java")) && javaRoots.some(root => {
+    const r = root.replace(/\/$/, "");
+    return file === r || file.startsWith(r + "/") || (directory && r.startsWith(file + "/"));
+  });
   return (
-    !file.split("/").some((p) => excluded.has(p) || p.startsWith(".cache")) &&
+    !file.split("/").some((p, i) => (excluded.has(p) && !((p === "runtime" || p === "build") && i >= packageStart && selectedSource)) || p.startsWith(".cache")) &&
     !sensitive.test(file) &&
     !extra.some((p) => globMatches(file, p))
   );
@@ -111,7 +118,7 @@ function globMatches(file: string, pattern: string): boolean {
     file,
   );
 }
-async function walk(root: string, limit = 10000): Promise<string[]> {
+async function walk(root: string, limit = 10000, javaRoots: string[] = []): Promise<string[]> {
   const found: string[] = [];
   let examined = 0;
   async function visit(dir: string) {
@@ -121,7 +128,7 @@ async function walk(root: string, limit = 10000): Promise<string[]> {
     )) {
       if (found.length >= limit) return;
       const name = slash(path.relative(root, path.join(dir, e.name)));
-      if (!allowed(name) || e.isSymbolicLink()) continue;
+      if (!allowed(name, [], javaRoots, e.isDirectory()) || e.isSymbolicLink()) continue;
       if (e.isDirectory()) await visit(path.join(dir, e.name));
       else if (e.isFile()) found.push(name);
     }
@@ -173,10 +180,14 @@ export async function scanWorkspace(
     branch: string | null = null,
     dirty = false;
   let extra: string[] = [...(options.exclude || [])];
+  let javaRoots: string[] = [];
   try {
     const config = JSON.parse(
       await fs.readFile(path.join(base, ".nativue/config.json"), "utf8"),
     );
+    if (config.java?.enabled && Array.isArray(config.java.roots))
+      javaRoots = [config.java, ...(Array.isArray(config.java.scopes) ? config.java.scopes : [])]
+        .flatMap(scope => Array.isArray(scope.roots) ? scope.roots : []).filter((p: unknown) => typeof p === "string");
     if (Array.isArray(config.exclude))
       extra.push(
         ...config.exclude.filter((p: unknown) => typeof p === "string"),
@@ -200,7 +211,7 @@ export async function scanWorkspace(
       ).trim(),
     );
   } catch {
-    candidates = await walk(base);
+    candidates = await walk(base, 10000, javaRoots);
     warnings.push(
       "Git metadata unavailable; scanned local files. / 无 Git 版本信息，使用本地文件扫描。",
     );
@@ -226,9 +237,12 @@ export async function scanWorkspace(
       (p) =>
         !path.isAbsolute(p) &&
         !p.split("/").includes("..") &&
-        allowed(p, extra),
+        allowed(p, extra, javaRoots),
     )
-    .sort();
+    .sort((a,b) => {
+      const selected = (file: string) => javaRoots.some(r=>file === r || file.startsWith(r.replace(/\/$/, "") + "/"));
+      return Number(selected(b)) - Number(selected(a)) || (a < b ? -1 : a > b ? 1 : 0);
+    });
   if (candidates.length > 5000)
     warnings.push("Scan limited to 5000 files. / 扫描限制为 5000 个文件。");
   const files: FileEntry[] = [];

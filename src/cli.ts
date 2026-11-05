@@ -33,7 +33,7 @@ const positional = args.filter(
 );
 const resolveRoot = (p?: string) =>
   fs.realpathSync(path.resolve(p || process.cwd()));
-const help = `Nativue AI · SienGe AI Lab\nYour canvas for AI-native development.\n\n  nativue init [workspace] [--tool codex|claude|workbuddy] [--language en|zh]\n               [--mode manual|automatic] [--github https://github.com/org/repo.git] [--branch main]\n  nativue serve [workspace] [--port 4317]\n  nativue scan|analyze|sync|issues|doctor|check|stop [workspace]\n  nativue configure-runner <codex|claude|off> [workspace]\n  nativue import-analysis <result.json> [workspace] [--source local|remote]\n  nativue task <task.json> [workspace] --revision N --actor SESSION\n  nativue handoff <A|B|C> [taskId] [--workspace dir]\n  nativue install-skill <codex|claude|workbuddy> [workspace] [--destination dir]\n\nState is local in .nativue/. No background model runs until an analysis.command argv array is configured.\nUse the generated analysis-request.json with your host Agent and import-analysis for semantic architecture.\n`;
+const help = `Nativue AI · SienGe AI Lab\nYour canvas for AI-native development.\n\n  nativue init [workspace] [--tool codex|claude|workbuddy] [--language en|zh]\n               [--mode manual|automatic] [--github https://github.com/org/repo.git] [--branch main]\n  nativue serve [workspace] [--port 4317]\n  nativue scan|analyze|sync|issues|doctor|check|stop [workspace]\n  nativue configure-java [workspace] [--scope path] [--parent moduleId] [--config rules.json] [--off]\n  nativue configure-runner <codex|claude|off> [workspace]\n  nativue import-analysis <result.json> [workspace] [--source local|remote]\n  nativue task <task.json> [workspace] --revision N --actor SESSION\n  nativue handoff <A|B|C> [taskId] [--workspace dir]\n  nativue install-skill <codex|claude|workbuddy> [workspace] [--destination dir]\n\nState is local in .nativue/. No background model runs until an analysis.command argv array is configured.\nUse the generated analysis-request.json with your host Agent and import-analysis for semantic architecture.\n`;
 async function main() {
   switch (command) {
     case "help":
@@ -193,6 +193,23 @@ async function main() {
           ? "Background analysis disabled; packets remain available"
           : `Configured ${tool} CLI for read-only source-packet analysis. This uses your host account and model usage. Daily call limit: ${c.analysis.maxCallsPerDay}.`,
       );
+      return;
+    }
+    case "configure-java": {
+      const root = resolveRoot(positional[0]);
+      const c = readConfig(root);
+      if (args.includes("--off")) {
+        c.java = { ...(c.java || { roots: [], features: [] }), enabled: false };
+      } else {
+        const rules = value("config");
+        c.java = rules ? JSON.parse(fs.readFileSync(path.resolve(rules), "utf8")) :
+          { enabled: true, roots: value("scope") ? [value("scope")] : [], features: [], ...(value("parent") ? {parentId: value("parent")} : {}) };
+      }
+      saveConfig(root, c);
+      if (c.java?.enabled) {
+        const snap = await new Runtime(root).scan(true);
+        console.log(JSON.stringify(snap?.java));
+      } else console.log("Java source analysis disabled");
       return;
     }
     case "sync": {

@@ -8,6 +8,7 @@ import { scanWorkspace, discoverWorkspaces } from "../src/scanner.ts";
 import { readLedger, writeLedger, updateTask } from "../src/ledger.ts";
 import { syncRemote } from "../src/remote.ts";
 import type { Task, Config } from "../src/types.ts";
+import { defaultConfig, saveConfig } from "../src/store.ts";
 const revision = "a".repeat(40),
   integration = "b".repeat(40);
 async function fixture() {
@@ -53,6 +54,35 @@ const config = {
     branch: "main",
   },
 } as Config;
+test("explicit Java scopes include runtime/build source packages while retaining data, secret, ignore and symlink exclusions", async () => {
+  for (const withGit of [false,true]) for (const packageName of ["runtime", "build"]) {
+    const {root,clean}=await fixture();
+    try {
+      if(withGit) git(root,"init","--quiet");
+      const selected=`module/src/main/java/demo/${packageName}/Gate.java`;
+      const unselected=`module/src/main/java/demo/${packageName}/Other.java`;
+      const excludedFiles=[`${packageName}/state.java`,`${packageName}/module/src/main/java/demo/Gate.java`,
+        `module/src/main/java/demo/${packageName}/state.json`,`module/src/main/java/demo/${packageName}/.env`,
+        `module/src/main/java/demo/${packageName}/secrets/Hidden.java`,`module/src/main/java/demo/${packageName}/credentials.json`,
+        `module/src/main/java/demo/${packageName}/Ignored.java`];
+      for(const file of [selected,unselected,...excludedFiles])await put(root,file,`package demo.${packageName}; class Gate {}\n`);
+      await put(root,".gitignore","**/Ignored.java\n");
+      await fs.symlink(path.join(root,selected),path.join(root,`module/src/main/java/demo/${packageName}/Link.java`));
+      assert.ok(!(await scanWorkspace(root)).files.some(f=>f.path===selected));
+      const c=defaultConfig();
+      c.java={enabled:true,roots:[selected],features:[]};saveConfig(root,c);
+      let files=(await scanWorkspace(root)).files.map(f=>f.path);
+      assert.ok(files.includes(selected));assert.ok(!files.includes(unselected));
+      assert.ok(excludedFiles.every(p=>!files.includes(p)));
+      c.java.roots=["module/src/main/java"];saveConfig(root,c);
+      files=(await scanWorkspace(root)).files.map(f=>f.path);
+      assert.ok(files.includes(selected)&&files.includes(unselected));
+      assert.ok(excludedFiles.every(p=>!files.includes(p)));
+      assert.ok(!files.some(p=>p.endsWith("/Link.java")));
+      assert.ok(!(await scanWorkspace(root,"local",{exclude:[selected]})).files.some(f=>f.path===selected));
+    } finally {await clean();}
+  }
+});
 test("scanner excludes tracked secrets, ignored files, generated files and symlinks; observes imports and stable input IDs", async () => {
   const { root, clean } = await fixture();
   try {

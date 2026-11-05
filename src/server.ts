@@ -11,10 +11,14 @@ import {
   readSnapshot,
   stateDir,
   atomicJson,
+  readJson,
 } from "./store.ts";
 import { readLedger, updateTask } from "./ledger.ts";
 import { remoteCheckoutPath } from "./remote.ts";
 import { capabilities, handoff } from "./adapters.ts";
+import { readDescriptions, updateDescription, withDescriptions } from "./descriptions.ts";
+import { readArchitectureEdits, updateArchitectureEdit, withArchitectureEdits } from "./architecture-edits.ts";
+import { withModuleGroups } from "./module-groups.ts";
 const web = path.resolve(
   path.dirname(fileURLToPath(import.meta.url)),
   "../web",
@@ -39,7 +43,10 @@ export async function serve(root: string, port = 4317) {
   let url = "";
   const streams = new Set<http.ServerResponse>();
   runtime.listeners.add(() => {
-    for (const r of streams) r.write("data: refresh\n\n");
+    for (const r of streams) {
+      if (r.destroyed || r.writableEnded) streams.delete(r);
+      else r.write("data: refresh\n\n");
+    }
   });
   const json = (res: http.ServerResponse, status: number, value: unknown) => {
     res.writeHead(status, {
@@ -78,6 +85,16 @@ export async function serve(root: string, port = 4317) {
           if (body.length > 2_000_000) throw Error("Request too large");
         }
         const b = JSON.parse(body || "{}");
+        if (u.pathname === "/api/architecture-edits") {
+          const edits = updateArchitectureEdit(root, b);
+          runtime.emit();
+          return json(res, 200, {revision: edits.revision});
+        }
+        if (u.pathname === "/api/descriptions") {
+          const descriptions = updateDescription(root, b);
+          runtime.emit();
+          return json(res, 200, {revision: descriptions.revision});
+        }
         if (u.pathname === "/api/config") {
           if (
             JSON.stringify(b.config.analysis.command) !==
@@ -132,11 +149,17 @@ export async function serve(root: string, port = 4317) {
         return json(res, 405, { error: "Method not allowed" });
       if (u.pathname === "/api/state") {
         const config = readConfig(root);
+        const descriptions = readDescriptions(root);
+        const edits = readArchitectureEdits(root);
         return json(res, 200, {
           workspaceName: path.basename(root),
+          workspaceId: crypto.createHash("sha256").update(root).digest("hex").slice(0,24),
           config,
-          local: readSnapshot(root),
-          remote: readSnapshot(root, "remote"),
+          descriptionRevision: descriptions.revision,
+          architectureRevision: edits.revision,
+          layoutRequests: readJson(path.join(stateDir(root), "layout-requests.json"), {}),
+          local: withModuleGroups(withDescriptions(withArchitectureEdits(readSnapshot(root), edits), descriptions), config.moduleGroups),
+          remote: withModuleGroups(withDescriptions(withArchitectureEdits(readSnapshot(root, "remote"), edits), descriptions), config.moduleGroups),
           ledger: readLedger(root),
           runtime: runtime.state,
           capabilities: capabilities(config),
@@ -216,6 +239,7 @@ export async function serve(root: string, port = 4317) {
     if (closing) return;
     closing = true;
     streams.forEach((r) => r.end());
+    streams.clear();
     server.close();
     await runtime.close();
     try {

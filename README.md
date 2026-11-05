@@ -4,6 +4,8 @@
 
 English · [简体中文](README.zh-CN.md)
 
+Development repository: [ooyyz/nativue-ai](https://github.com/ooyyz/nativue-ai).
+
 **A development canvas for non-technical vibe coders managing complex software projects.**
 
 When an AI-built project grows toward production, features multiply, modules depend on one another, and several agents may work at once. The challenge grows from getting code written to **keeping the whole project in view, keeping AI on track, and moving work forward.**
@@ -57,6 +59,8 @@ Modules are grouped into frontend, backend, application services and infrastruct
 
 ![English architecture map for the fictional Orbit Desk example, with 15 related modules](assets/demo-architecture.en.png)
 
+Single-click a module to inspect its details; double-click a module with children to open its internal architecture. Use the breadcrumb or Back button to return; each level retains its layout and viewport. Child modules and relationships come from source-backed analysis.
+
 ### 2. Journeys: trace one real action through the system
 
 Choose a journey such as “Create and publish a document” to highlight its modules and read every step in order. Inferred paths remain visibly labeled and never substitute for independent runtime acceptance.
@@ -103,6 +107,18 @@ Models are user-configured by role. Nativue does not switch the current conversa
 | WorkBuddy | Generic Skill and manual A/B/C workflow | Not claimed without a verified interface | Not yet recorded |
 
 “Included” means the repository contains the instructions and integration paths; it does not mean all three products have been exercised end to end. A real Codex CLI background analysis passed on a fictional two-file TypeScript repository; manual A/B/C and automatic subagent delivery remain unverified in the hosts. The local test suite and host verification are separate. [Claude Code documents Skills](https://code.claude.com/docs/en/skills), and [WorkBuddy documents Skill plugins](https://www.workbuddy.cn/docs/workbuddy/Plugins); these are not evidence that Nativue's automatic scheduling has been tested. See [setup, exact tested versions and limits](docs/compatibility.md).
+
+## Automatic Java source graphs
+
+Enable the local parser with `node bin/nativue.js configure-java /path/to/workspace --scope src`. To attach to an existing module, add `--parent moduleId`; `--config rules.json` accepts `enabled`, `roots`, optional `parentId`, and feature entry rules (`id`, `name`, `seeds`). A rule names entry symbols; classes, methods and relationships are extracted automatically. Without rules, features are inferred from declaration names and source relationships.
+
+The map drills from a feature into classes, methods and a two-hop call graph. It resolves declared inheritance, implementations, annotated injection, constructor dependencies and method calls with source locations. Unresolved and ambiguous targets stay diagnostic. File watching reuses unchanged syntax facts, refreshes relationships and displays graph changes; saved scope layouts survive refreshes. Static targets do not prove runtime dispatch. See [scope, resolution and limitations](docs/java-architecture.md).
+
+Within a feature, the class canvas groups interfaces with implementations and base types with subtypes. Nested classes and enums are indented and identify their declaring type. Arrows show source relationships such as implementation or inheritance; brackets without arrows show nested type ownership. **Code hierarchy** in the details panel links to related types, including those in other features. Saved manual positions remain intact; **Arrange code hierarchy** rearranges only the current feature. Grouping uses source declarations, not names such as `Impl`, and does not change feature membership.
+
+Leading Javadoc, block and line comments automatically fill class/method responsibilities with source locations. Without configured feature rules, short comment summaries supply inferred capability names; optional `@feature Name` / `功能：名称` labels on classes or methods give clearer grouping. Click **Edit** beside **What it does** to save your own explanation. Manual text survives rescans and restarts; **Restore automatic content** uses the latest source explanation. Local and remote descriptions are stored separately in the workspace's ignored `.nativue/descriptions.json`.
+
+Feature details offer **Rename**, and class details offer **Change feature**. A class can move to another feature in the same architecture; its methods move with it and visible relationships follow the new hierarchy. Names and memberships are saved independently in `.nativue/architecture-edits.json`, survive analysis updates, and each can **Restore automatic result**. If a saved target disappears from source, its setting stays dormant and the current automatic membership is shown with a notice until the target returns.
 
 ## Staying current
 
