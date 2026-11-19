@@ -69,7 +69,7 @@ Choose a journey such as “Create and publish a document” to highlight its mo
 
 ### 3. Parallel tasks: coordinate A, B and C around dependencies
 
-Tasks are grouped by dependency depth. Each card exposes priority, developer, reviewer, prerequisites and current stage. Development, self-testing, independent C review, integration review and the user's handtest stay distinct.
+Tasks with a module label can be grouped by module or dependency depth. Each card exposes priority, developer, reviewer, prerequisites and current stage. Development, self-testing, independent C review, integration review and the user's handtest stay distinct.
 
 ![English parallel task canvas for the fictional Orbit Desk example, with nine tasks across four dependency groups](assets/demo-parallel.en.png)
 

@@ -125,6 +125,8 @@ export type TaskStatus =
   | "integration-passed"
   | "handtest"
   | "done";
+export const taskProgressOptions = ["todo", "developing", "testing", "done"] as const;
+export type TaskProgress = (typeof taskProgressOptions)[number];
 export interface Review {
   reviewer: string;
   commit: string;
@@ -136,8 +138,10 @@ export interface Review {
 export interface Task {
   id: string;
   title: string;
+  module?: string;
   priority: "P0" | "P1" | "P2";
   status: TaskStatus;
+  progress?: TaskProgress | null;
   issue?: string;
   description: string;
   criteria: string[];
@@ -152,6 +156,7 @@ export interface Task {
   commit?: string;
   integrationCommit?: string;
   reviews: Review[];
+  acceptanceNotes?: string;
   integrationReview?: Review;
   userAcceptance?: { commit: string; source: string; at: string };
   blocked?: string;

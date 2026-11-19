@@ -1,11 +1,16 @@
 import { codeHierarchy, type CodeHierarchy } from "./code-hierarchy.ts";
-import type {
-  DashboardState,
-  Snapshot,
-  Module,
-  Task,
-  Config,
-  Journey,
+import { canEditTaskScope, taskTransitions } from "../src/task-workflow.ts";
+import {
+  taskProgressOptions,
+  type DashboardState,
+  type Snapshot,
+  type Module,
+  type Edge,
+  type Task,
+  type TaskProgress,
+  type TaskStatus,
+  type Config,
+  type Journey,
 } from "../src/types.ts";
 const app = document.querySelector<HTMLDivElement>("#app")!;
 const esc = (value: unknown) =>
@@ -21,6 +26,7 @@ let data: DashboardState | null = null,
 let source: "local" | "remote" = "local",
   tab: "updates" | "journeys" | "folders" = "updates",
   viewMode: "map" | "parallel" = "map";
+let parallelGrouping: "module" | "dependency" = "module";
 let selectedModule = "",
   selectedTask = "",
   selectedJourney = "",
@@ -30,7 +36,9 @@ let selectedModule = "",
   related: string[] = [],
   relatedOnly = false;
 let mapParent = "", callRoot = "", layoutKey = "", mapQuery = "";
+let showIndexedDirectories = false;
 let canvasGestureActive = false, canvasRenderPending = false;
+let layoutSaveTimer: ReturnType<typeof setTimeout> | undefined;
 interface MapLocation {
   arrangeRevision?: string;
   view: typeof view;
@@ -39,6 +47,7 @@ interface MapLocation {
   groups: typeof groupPositions;
   collapsed: Set<string>;
   query?: string;
+  showIndexedDirectories?: boolean;
 }
 const mapLocations = new Map<string, MapLocation>();
 let modal = "",
@@ -71,30 +80,80 @@ const labels: Record<string, [string, string]> = {
   done: ["Accepted", "用户已确认"],
 };
 const statusLabel = (s: string) => (labels[s] ? text(...labels[s]) : s);
+const progressLabel = (status: string) => status === "testing"
+  ? text("Ready for testing", "待测试")
+  : status === "done"
+    ? text("Completed", "已完成")
+    : statusLabel(status);
+const taskStatusLabel = (task: Task) => task.progress ? progressLabel(task.progress) : statusLabel(task.status);
 const snapshot = (): Snapshot | null =>
   data ? (source === "remote" ? data.remote : data.local) : null;
-const moduleById = (id: string) => snapshot()?.modules.find((m) => m.id === id);
-const childModules = (id: string) =>
-  snapshot()?.modules.filter((m) => (m.parentId || "") === id) || [];
+interface GraphIndex {
+  modules: Map<string, Module>;
+  children: Map<string, Module[]>;
+  incidentEdges: Map<string, Edge[]>;
+}
+const graphIndexes = new WeakMap<Snapshot, GraphIndex>();
+function graphIndex() {
+  const s = snapshot();
+  if (!s) return undefined;
+  const cached = graphIndexes.get(s);
+  if (cached) return cached;
+  const index: GraphIndex = {modules: new Map(), children: new Map(), incidentEdges: new Map()};
+  for (const module of s.modules) {
+    index.modules.set(module.id, module);
+    const parent = module.parentId || "";
+    if (!index.children.has(parent)) index.children.set(parent, []);
+    index.children.get(parent)!.push(module);
+  }
+  for (const edge of s.edges) {
+    for (const id of edge.from === edge.to ? [edge.from] : [edge.from, edge.to]) {
+      if (!index.incidentEdges.has(id)) index.incidentEdges.set(id, []);
+      index.incidentEdges.get(id)!.push(edge);
+    }
+  }
+  graphIndexes.set(s, index);
+  return index;
+}
+const moduleById = (id: string) => graphIndex()?.modules.get(id);
+const childModules = (id: string) => graphIndex()?.children.get(id) || [];
 function callChainModules() {
   const ids = new Set([callRoot]), queue = [{id: callRoot, depth: 0}];
-  const calls = snapshot()?.edges.filter(e => e.relation === "calls") || [];
+  const incidentEdges = graphIndex()?.incidentEdges;
   for (let i = 0; i < queue.length; i++) {
     const {id, depth} = queue[i];
     if (depth >= 2) continue;
-    for (const e of calls) {
-      const next = e.from === id ? e.to : e.to === id ? e.from : "";
+    for (const e of incidentEdges?.get(id) || []) {
+      if (e.relation !== "calls") continue;
+      const next = e.from === id ? e.to : e.from;
       if (next && !ids.has(next) && ids.size < 80) { ids.add(next); queue.push({id: next, depth: depth + 1}); }
     }
   }
   return snapshot()?.modules.filter(m => ids.has(m.id)) || [];
 }
-const visibleMapModules = () => (callRoot ? callChainModules() : childModules(mapParent)).filter(m => !mapQuery || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(mapQuery.toLowerCase()));
+// 已有快照中的目录节点可能来自初次扫描或后续增量合并。
+const isIndexedDirectory = (m: Module) => m.kind === "directory" && /^(?:scan-)?module-[0-9a-f]{12}$/.test(m.id);
+function indexedDirectoryCount() {
+  if (mapParent || callRoot) return 0;
+  const roots = childModules("");
+  const count = roots.filter(isIndexedDirectory).length;
+  return count < roots.length ? count : 0;
+}
+function visibleMapModules() {
+  const hideIndexedDirectories = !showIndexedDirectories && indexedDirectoryCount() > 0;
+  const query = mapQuery.toLowerCase();
+  return (callRoot ? callChainModules() : childModules(mapParent)).filter(m =>
+    (!hideIndexedDirectories || !isIndexedDirectory(m)) && (!query || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(query)),
+  );
+}
 const scopeKey = () => mapParent + (callRoot ? "#calls:" + callRoot : "");
 function rememberMap() {
+  clearTimeout(layoutSaveTimer);
+  layoutSaveTimer = undefined;
   mapLocations.set(scopeKey(), { view: {...view}, selectedModule,
     arrangeRevision: mapLocations.get(scopeKey())?.arrangeRevision,
-    nodes: new Map(nodePositions), groups: new Map(groupPositions), collapsed: new Set(collapsed), query: mapQuery });
+    nodes: new Map(nodePositions), groups: new Map(groupPositions), collapsed: new Set(collapsed), query: mapQuery,
+    showIndexedDirectories });
   if (!layoutKey) return;
   try { localStorage.setItem(layoutKey, JSON.stringify({parent: mapParent, callRoot, locations: [...mapLocations].map(([id,l]) => [id,{...l,nodes:[...l.nodes],groups:[...l.groups],collapsed:[...l.collapsed]}])})); } catch {}
 }
@@ -118,7 +177,9 @@ function restoreMap() {
       for (const [id,p] of location.nodes) nodePositions.set(id,p);
       for (const [id,p] of location.groups) groupPositions.set(id,p);
       for (const id of location.collapsed) collapsed.add(id);
-      view = {...location.view}; selectedModule = location.selectedModule; mapQuery = location.query || ""; initialFit = true;
+      view = {...location.view}; selectedModule = location.selectedModule; mapQuery = location.query || "";
+      showIndexedDirectories = location.showIndexedDirectories ?? false;
+      initialFit = location.showIndexedDirectories !== undefined || !indexedDirectoryCount();
     }
   } catch { mapLocations.clear(); }
 }
@@ -132,7 +193,7 @@ function moduleTrail(id: string): Module[] {
   }
   return trail;
 }
-function navigateMap(parent: string, calls = "") {
+function navigateMap(parent: string, calls = "", redraw = true) {
   if (parent === mapParent && calls === callRoot) return;
   rememberMap();
   mapParent = parent;
@@ -147,16 +208,23 @@ function navigateMap(parent: string, calls = "") {
   view = saved ? { ...saved.view } : { x: 0, y: 0, scale: 1 };
   selectedModule = saved?.selectedModule || calls || parent;
   mapQuery = saved?.query || "";
+  showIndexedDirectories = saved?.showIndexedDirectories ?? false;
   selectedTask = "";
   journeyStep = -1;
   tab = "updates";
-  initialFit = Boolean(saved);
-  render();
-  requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+  initialFit = Boolean(saved && (saved.showIndexedDirectories !== undefined || !indexedDirectoryCount()));
+  if (redraw) {
+    render();
+    requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+  }
 }
-function renderMapNavigation() {
+function renderMapNavigation(moduleCount: number) {
   const trail = moduleTrail(mapParent);
-  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "架构层级")}">${(mapParent || callRoot) ? `<button id="map-up">← ${text("Back", "返回上层")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "主架构")}</button>` : `<span aria-current="page">${text("Main architecture", "主架构")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain · 2 hops · max 80", "调用链 · 两跳 · 最多 80 个节点")}</span></li>` : ""}</ol><span class="map-scope-count">${visibleMapModules().length} ${text("modules", "个模块")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "查找类或方法")}" placeholder="${text("Find a class or method", "查找类或方法")}" value="${esc(mapQuery)}">` : ""}</nav>`;
+  const directoryCount = indexedDirectoryCount();
+  const directoryToggle = directoryCount
+    ? `<button id="indexed-directories" aria-pressed="${showIndexedDirectories}">${text("Indexed directories", "索引目录")} · ${directoryCount}</button>`
+    : "";
+  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "架构层级")}">${(mapParent || callRoot) ? `<button id="map-up">← ${text("Back", "返回上层")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "主架构")}</button>` : `<span aria-current="page">${text("Main architecture", "主架构")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain · 2 hops · max 80", "调用链 · 两跳 · 最多 80 个节点")}</span></li>` : ""}</ol><span class="map-scope-count">${moduleCount} ${text("modules", "个模块")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "查找类或方法")}" placeholder="${text("Find a class or method", "查找类或方法")}" value="${esc(mapQuery)}">` : ""}${directoryToggle}</nav>`;
 }
 const formatDate = (v?: string) =>
   v
@@ -298,6 +366,7 @@ function groupTitle(kind: string) {
     package: ["Packages", "软件包"],
     application: ["Applications", "应用"],
     infrastructure: ["Infrastructure", "基础设施"],
+    directory: ["Indexed directories", "索引目录"],
   };
   return titles[kind] ? text(...titles[kind]) : kind || text("Modules", "模块");
 }
@@ -323,7 +392,10 @@ function groups(): Group[] {
   const columns = mapParent
     ? Math.max(1, Math.min(entries.length, Math.round(Math.sqrt(entries.length * stageSize.width / stageSize.height))))
     : Math.max(1, entries.length);
-  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns || (mapParent ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3)))) : 1));
+  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns ||
+    (mapParent || (showIndexedDirectories && id === "directory")
+      ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3))))
+      : 1));
   const hierarchies = entries.map(([, modules], i) => hierarchyFor(modules, nodeColumns[i]));
   const result: Group[] = [];
   for (const [i, [id, modules]] of entries.entries()) {
@@ -350,7 +422,7 @@ function groups(): Group[] {
       id,
       title: groupTitle(id),
       description: descriptions.get(id),
-      modules: hierarchies[i] ? hierarchies[i]!.families.flatMap(f => f.members.map(id => modules.find(m => m.id === id)!)) : modules,
+      modules: hierarchies[i] ? hierarchies[i]!.families.flatMap(f => f.members.map(id => moduleById(id)!)) : modules,
       color: palettes[i % palettes.length],
       ...p,
       columns: nodeColumns[i],
@@ -361,23 +433,23 @@ function groups(): Group[] {
   }
   return result;
 }
-function nodePos(m: Module, g?: Group) {
+function nodePos(m: Module, g?: Group, index?: number) {
+  const saved = nodePositions.get(m.id);
+  if (saved) return saved;
   g = g || groups().find((gr) => gr.modules.some((n) => n.id === m.id));
-  const i = g?.modules.findIndex((n) => n.id === m.id) || 0;
+  const i = index ?? g?.modules.findIndex((n) => n.id === m.id) ?? 0;
   const planned = g?.hierarchy?.positions.get(m.id);
-  const position = (
-    nodePositions.get(m.id) || {
-      x: (g?.x || 0) + 25 + (planned?.x ?? (i % (g?.columns || 1)) * 350) + (m.x || 0),
-      y: (g?.y || 0) + 115 + (g?.description ? 40 : 0) + (planned?.y ?? Math.floor(i / (g?.columns || 1)) * 164) + (m.y || 0),
-    }
-  );
-  if (mapParent && !nodePositions.has(m.id)) {
+  const position = {
+    x: (g?.x || 0) + 25 + (planned?.x ?? (i % (g?.columns || 1)) * 350) + (m.x || 0),
+    y: (g?.y || 0) + 115 + (g?.description ? 40 : 0) + (planned?.y ?? Math.floor(i / (g?.columns || 1)) * 164) + (m.y || 0),
+  };
+  if (mapParent) {
     while ([...nodePositions.values()].some(p=>p.x===position.x&&p.y===position.y)) position.y += 164;
     nodePositions.set(m.id, position);
   }
   return position;
 }
-function activeModules() {
+function activeModules(gs: Group[]) {
   if (selectedTask) {
     const task = data?.ledger.tasks.find((t) => t.id === selectedTask);
     return new Set(
@@ -396,7 +468,7 @@ function activeModules() {
           ) || [],
     );
   }
-  const family = groups().flatMap(g => g.hierarchy?.families || []).find(f => f.members.includes(selectedModule));
+  const family = gs.flatMap(g => g.hierarchy?.families || []).find(f => f.members.includes(selectedModule));
   return new Set(family?.members || (selectedModule && selectedModule !== mapParent ? [selectedModule] : []));
 }
 function render() {
@@ -423,7 +495,7 @@ function render() {
     r = data.runtime;
   document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
   document.title = `Tika's Code · ${workspaceTitle()}`;
-  app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "开发画布")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "说明与导航")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "调整右侧宽度")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "代码与运行地图")}</h1><select id="version-picker" aria-label="${text("View version", "查看版本")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "当前工作区")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "远端分支")}${data.config.remote.branch ? " · " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "画布视图")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "并行开发")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "代码地图")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "更新源码索引")}" ${busy ? "disabled" : ""}>↻</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "设置")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "切换到英文")}">${lang === "zh" ? "EN" : "中文"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "并行开发")}</h2><p class="empty-text">${text("Tasks are grouped by dependency depth, not by status. Click a card for scope, ownership, commits and independent review evidence.", "任务按依赖层级分组，不按状态分列。点击卡片查看范围、认领、提交和独立验收证据。")}</p><button class="primary" id="new-task">＋ ${text("New task", "新建任务")}</button>${renderTaskDetail(undefined)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "架构辅助导航")}">${(["updates", "journeys", "folders"] as const).map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "本次更新"), text("Journeys", "操作旅程"), text("Folders", "文件夹")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "颜色、连线和验证边界")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "大模块底色区分类别。实线表示有观察或核对依据的源码关系，点线表示推断。源码分析不等于运行验收。")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "拖动卡片或组标题；拖动空白平移，滚轮缩放。方向键移动，加减键缩放，0 回到全图。")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "版本与使用说明")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "工作区")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "今日 AI 调用")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "分析")}</button><button id="pause-button">${r.paused ? text("Resume", "恢复") : text("Pause", "暂停")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "同步远端")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI · ${esc(short(s?.source.commit))}${s?.source.dirty ? " · " + text("modified", "有修改") : ""}</span><button class="subtle" id="help-button">${text("Help", "使用帮助")}</button></div><span class="attribution">SienGe AI Lab · 小红书：SienGe的AI实验室</span></footer></aside></main>`;
+  app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "开发画布")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "说明与导航")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "调整右侧宽度")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "代码与运行地图")}</h1><select id="version-picker" aria-label="${text("View version", "查看版本")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "当前工作区")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "远端分支")}${data.config.remote.branch ? " · " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "画布视图")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "并行开发")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "代码地图")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "更新源码索引")}" ${busy ? "disabled" : ""}>↻</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "设置")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "切换到英文")}">${lang === "zh" ? "EN" : "中文"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "并行开发")}</h2><p class="empty-text">${text("Click a card for scope, ownership, commits and independent review evidence.", "点击卡片查看范围、认领、提交和独立验收证据。")}</p><button class="primary" id="new-task">＋ ${text("New task", "新建任务")}</button>${renderTaskDetail(undefined)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "架构辅助导航")}">${(["updates", "journeys", "folders"] as const).map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "本次更新"), text("Journeys", "操作旅程"), text("Folders", "文件夹")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "颜色、连线和验证边界")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "大模块底色区分类别。实线表示有观察或核对依据的源码关系，点线表示推断。源码分析不等于运行验收。")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "拖动卡片或组标题；拖动空白平移，滚轮缩放。方向键移动，加减键缩放，0 回到全图。")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "版本与使用说明")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "工作区")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "今日 AI 调用")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "分析")}</button><button id="pause-button">${r.paused ? text("Resume", "恢复") : text("Pause", "暂停")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "同步远端")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI · ${esc(short(s?.source.commit))}${s?.source.dirty ? " · " + text("modified", "有修改") : ""}</span><button class="subtle" id="help-button">${text("Help", "使用帮助")}</button></div><span class="attribution">且共从容</span></footer></aside></main>`;
   bind();
   bindResize();
   bindCanvas(viewMode === "parallel");
@@ -482,13 +554,23 @@ function renderJavaStatus() {
   const c = j.changes;
   return `<details class="java-report" ${j.status === "failed" ? "open" : ""}><summary>${text("Java automatic source graph", "Java 源码自动建图")} · ${j.status === "failed" ? text("Failed · previous graph retained", "失败 · 保留上一有效图") : text("Updated", "已更新")}</summary><p>${text("Parsed / cached / re-resolved files", "解析 / 缓存复用 / 关系重算文件")}: ${j.parsedFiles} / ${j.reusedFiles} / ${j.resolvedFiles}</p><p>${text("Added / changed / removed nodes", "新增 / 变化 / 删除节点")}: ${c.added.length} / ${c.changed.length} / ${c.removed.length}<br>${text("Added / changed / removed relationships", "新增 / 变化 / 删除关系")}: ${c.addedEdges.length} / ${c.changedEdges.length} / ${c.removedEdges.length}</p>${c.removed.slice(0,20).map(m=>`<p class="removed-item">− ${esc(m.name)}</p>`).join("")}${c.removedEdges.slice(0,20).map(e=>`<p class="removed-item">− ${esc(e.relation)}: ${esc(e.label)}</p>`).join("")}<p>${text("Unresolved / ambiguous / parser diagnostics", "未解析 / 歧义 / 语法诊断")}: ${j.diagnosticCount}</p><div class="java-diagnostics">${j.diagnostics.slice(0,25).map(d=>`<p><code>${esc(d.path)}:${d.line}</code><br>${esc(d.kind)} · ${esc(d.message)}</p>`).join("")}</div><p>${text("Feature membership is inferred. Relationships describe declared source targets; reflection, complex call chains and runtime binding remain unresolved.", "功能归属是推断。连线表示源码声明目标；反射、复杂链式表达式和运行时绑定仍有解析边界。")}</p></details>`;
 }
-function mapEdges() {
-  const visible = new Set(visibleMapModules().map(m=>m.id));
-  const lift = (id: string) => callRoot ? visible.has(id) ? id : undefined :
-    moduleTrail(id).find(m=>(m.parentId || "") === mapParent)?.id;
+const edgeProjections = new WeakMap<Snapshot, {parent: string; language: typeof lang; edges: Edge[]}>();
+function mapEdges(visible: ReadonlySet<string>) {
+  const s = snapshot();
+  if (!s) return [];
+  const cached = edgeProjections.get(s);
+  if (!callRoot && cached?.parent === mapParent && cached.language === lang) return cached.edges;
+  const lifted = new Map<string, string | undefined>();
+  const lift = (id: string) => {
+    if (callRoot) return visible.has(id) ? id : undefined;
+    if (!lifted.has(id)) {
+      lifted.set(id, moduleTrail(id).find(m => (m.parentId || "") === mapParent)?.id);
+    }
+    return lifted.get(id);
+  };
   const projected = new Map<string, {edge: NonNullable<Snapshot>["edges"][number]; count: number}>();
   const result: Snapshot["edges"] = [];
-  for (const e of snapshot()?.edges || []) {
+  for (const e of s.edges) {
     if (e.generator !== "java") { if (!callRoot) result.push(e); continue; }
     if (callRoot && e.relation !== "calls") continue;
     const from = lift(e.from), to = lift(e.to);
@@ -502,7 +584,9 @@ function mapEdges() {
       if (e.change) existing.edge.change = e.change;
     } else projected.set(key, {edge:{...e,from,to},count:1});
   }
-  return [...result,...[...projected.values()].map(({edge,count})=>({...edge,label:edge.label+(count > 1 ? ` · ${count} ${text("source relationships", "条源码关系")}` : "")}))];
+  const edges = [...result,...[...projected.values()].map(({edge,count})=>({...edge,label:edge.label+(count > 1 ? ` · ${count} ${text("source relationships", "条源码关系")}` : "")}))];
+  if (!callRoot) edgeProjections.set(s, {parent: mapParent, language: lang, edges});
+  return edges;
 }
 function typeName(m: Module) {
   const names: Record<string, [string, string]> = {class: ["Class", "类"], interface: ["Interface", "接口"], enum: ["Enum", "枚举"], record: ["Record", "记录类"]};
@@ -512,7 +596,7 @@ function typeRelations(m: Module) {
   const relations: {target: Module; label: string}[] = [];
   const owner = moduleById(m.declaringTypeId || "");
   if (owner) relations.push({target: owner, label: text("Declared in", "内部类型，属于")});
-  for (const edge of snapshot()?.edges || []) {
+  for (const edge of graphIndex()?.incidentEdges.get(m.id) || []) {
     if (edge.from !== m.id || !["implements", "extends"].includes(edge.relation || "")) continue;
     const target = moduleById(edge.to);
     if (target) relations.push({target, label: edge.relation === "implements" ? text("Implements", "实现") : text("Extends", "继承")});
@@ -541,10 +625,8 @@ function typeLinkPath(from: {x: number; y: number}, to: {x: number; y: number}) 
 function renderMap() {
   const s = snapshot(),
     gs = groups(),
-    active = activeModules();
-  const visibleIds = new Set(gs.flatMap(g=>g.modules.map(m=>m.id)));
-  const visible = (m: Module) =>
-    visibleIds.has(m.id) && !collapsed.has(m.kind || "source");
+    active = activeModules(gs);
+  const positions = new Map<string, {x: number; y: number}>();
   const nodes = gs
     .map(
       (g, i) =>
@@ -552,8 +634,10 @@ function renderMap() {
           !collapsed.has(g.id)
             ? renderTypeFamilies(g) + g.modules
                 .map((m, j) => {
-                  const p = nodePos(m, g);
-                  return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? (active.has(m.id) ? "highlighted" : "dim") : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childModules(m.id).length ? text("Click for details; double-click to open internal architecture; drag to move", "单击查看信息；双击进入内部架构；拖动调整位置") : text("Drag to move; click for details", "拖动调整位置；点击查看解释")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} ⠿${childModules(m.id).length ? ` · ↳ ${childModules(m.id).length} ${text("submodules", "子模块")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "新增") : text("Changed", "变化")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "等待说明"))}</span></button>`;
+                  const p = nodePos(m, g, j);
+                  positions.set(m.id, p);
+                  const childCount = childModules(m.id).length;
+                  return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? (active.has(m.id) ? "highlighted" : "dim") : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childCount ? text("Click for details; double-click to open internal architecture; drag to move", "单击查看信息；双击进入内部架构；拖动调整位置") : text("Drag to move; click for details", "拖动调整位置；点击查看解释")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} ⠿${childCount ? ` · ↳ ${childCount} ${text("submodules", "子模块")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "新增") : text("Changed", "变化")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "等待说明"))}</span></button>`;
                 })
                 .join("")
             : ""
@@ -568,13 +652,11 @@ function renderMap() {
   }));
   const bounds = boundsOf(rects, 180);
   const edges =
-    mapEdges()
+    mapEdges(new Set(callRoot ? gs.flatMap(g => g.modules.map(m => m.id)) : []))
       .map((e, i) => {
-        const a = moduleById(e.from),
-          b = moduleById(e.to);
-        if (!a || !b || !visible(a) || !visible(b)) return "";
-        const ar = nodePos(a),
-          br = nodePos(b);
+        const ar = positions.get(e.from), br = positions.get(e.to);
+        if (!ar || !br) return "";
+        const a = moduleById(e.from)!, b = moduleById(e.to)!;
         const focus =
           (active.size > 0 && active.has(e.from) && active.has(e.to)) ||
           (selectedModule &&
@@ -584,10 +666,11 @@ function renderMap() {
       .join("") || "";
   const containment = gs.flatMap(g => g.modules).map(m => {
     const owner = moduleById(m.declaringTypeId || "");
-    if (!owner || !visible(m) || !visible(owner)) return "";
-    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(nodePos(owner),nodePos(m))}"><title>${esc(owner.name)} · ${text("contains", "包含内部类型")} ${esc(m.name)}</title></path>`;
+    const memberPosition = positions.get(m.id), ownerPosition = positions.get(owner?.id || "");
+    if (!owner || !memberPosition || !ownerPosition) return "";
+    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(ownerPosition, memberPosition)}"><title>${esc(owner.name)} · ${text("contains", "包含内部类型")} ${esc(m.name)}</title></path>`;
   }).join("");
-  return `${renderMapNavigation()}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "架构画布。拖动空白移动，滚轮缩放；方向键移动，加减键缩放，0 回到全图。")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "远端代码地图") : text("Start with your code", "从你的代码开始")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "开启并同步远端后，即可查看独立快照。") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "请让 Agent 使用 Nativue Skill，从已索引代码分析模块、源码证据和操作旅程。")}</p><button id="empty-role">${text("Get Agent instructions", "获取 Agent 指令")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "连线图例")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "源码关系")}</div><div><span class="line-sample reference"></span>${text("Inferred · needs verification", "推断 · 待核实")}</div>${gs.some(g => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "无箭头括线：内部类型归属")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "箭头指向接收方，深色表示当前高亮。")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "画布视野")}"><button id="zoom-out" aria-label="${text("Zoom out", "缩小")}">−</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "放大")}">＋</button><span class="divider"></span><button id="fit">${text("Fit all", "全图")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "定位所选")}</button><button id="clear">${text("Clear", "清除高亮")}</button>${gs.some(g => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "按源码关系重新排列当前功能下的类型")}">${text("Arrange code hierarchy", "按代码层级排列")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "重置布局")}</button></div></div>`;
+  return `${renderMapNavigation(gs.reduce((count, group) => count + group.modules.length, 0))}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "架构画布。拖动空白移动，滚轮缩放；方向键移动，加减键缩放，0 回到全图。")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "远端代码地图") : text("Start with your code", "从你的代码开始")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "开启并同步远端后，即可查看独立快照。") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "请让 Agent 使用 Nativue Skill，从已索引代码分析模块、源码证据和操作旅程。")}</p><button id="empty-role">${text("Get Agent instructions", "获取 Agent 指令")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "连线图例")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "源码关系")}</div><div><span class="line-sample reference"></span>${text("Inferred · needs verification", "推断 · 待核实")}</div>${gs.some(g => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "无箭头括线：内部类型归属")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "箭头指向接收方，深色表示当前高亮。")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "画布视野")}"><button id="zoom-out" aria-label="${text("Zoom out", "缩小")}">−</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "放大")}">＋</button><span class="divider"></span><button id="fit">${text("Fit all", "全图")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "定位所选")}</button><button id="clear">${text("Clear", "清除高亮")}</button>${gs.some(g => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "按源码关系重新排列当前功能下的类型")}">${text("Arrange code hierarchy", "按代码层级排列")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "重置布局")}</button></div></div>`;
 }
 function boundsOf(
   rects: { x: number; y: number; width: number; height: number }[],
@@ -630,9 +713,10 @@ function edgePath(
   return `M${ax} ${ay} C${ax} ${ay + sign * curve},${bx} ${by - sign * curve},${bx} ${by}`;
 }
 function taskStage(t: Task) {
-  return t.status === "done"
+  const status = t.progress ?? t.status;
+  return status === "done"
     ? "passed"
-    : t.status === "rework"
+    : status === "rework"
       ? "rework"
       : [
             "review",
@@ -641,9 +725,10 @@ function taskStage(t: Task) {
             "integration-review",
             "integration-passed",
             "handtest",
-          ].includes(t.status)
+            "testing",
+          ].includes(status)
         ? "testing"
-        : t.status === "developing"
+        : status === "developing"
           ? "confirmed"
           : "discussion";
 }
@@ -674,12 +759,48 @@ function dependencyGroups() {
   return [...gs].sort(([a], [b]) => (a < 0 ? 1 : b < 0 ? -1 : a - b));
 }
 function renderParallel() {
-  const gs = dependencyGroups();
-  return `<section id="parallel-board" class="parallel-board" aria-label="${text("Dependency-grouped parallel development canvas", "按依赖分组的并行开发画布")}"><header class="parallel-heading"><h1>${text("Parallel development plan", "并行开发计划")}</h1><p>${data!.ledger.tasks.length} ${text("tasks · grouped by dependency depth · select a card for ownership and evidence", "个任务 · 按依赖层级分组 · 点卡片查看范围、分工与证据")}</p><div class="parallel-legend">${[
+  const byDepth = dependencyGroups();
+  const hasModules = data!.ledger.tasks.some(t => t.module);
+  const byModule = hasModules && parallelGrouping === "module";
+  const sortTasks = (a: Task, b: Task) => a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id);
+  const sections = byDepth.map(([depth, tasks]) => ({
+    key: String(depth),
+    title: depth < 0 ? text("Check dependencies", "待核对依赖") : text(`Group ${depth + 1}`, `第 ${depth + 1} 组`),
+    description: depth < 0
+      ? text("Missing task references or cyclic dependencies. Resolve before scheduling.", "依赖任务缺失或存在环路，请先核对再派工。")
+      : depth === 0
+        ? text("No recorded prerequisites. File ownership still determines safe parallelism.", "无已登记前置任务，仍需按文件认领判断是否可并行。")
+        : text("Contains prerequisites in earlier groups. Release each task against its actual dependency evidence.", "包含前序组依赖，须按每项实际依赖和验收证据逐项放行。"),
+    invalid: depth < 0,
+    tasks: tasks.sort(sortTasks),
+  }));
+  const moduleTasks = new Map<string, Task[]>();
+  const invalidSection = sections.find(section => section.invalid);
+  if (byModule) {
+    const invalidIds = new Set(invalidSection?.tasks.map(task => task.id));
+    for (const task of data!.ledger.tasks) {
+      if (invalidIds.has(task.id)) continue;
+      const module = task.module?.trim() || "";
+      if (!moduleTasks.has(module)) moduleTasks.set(module, []);
+      moduleTasks.get(module)!.push(task);
+    }
+  }
+  const gs = byModule ? [
+    ...[...moduleTasks].map(([module, tasks]) => ({
+      key: `module:${module}`,
+      title: module || text("Other tasks", "其他任务"),
+      description: "",
+      invalid: false,
+      tasks,
+    })),
+    ...(invalidSection ? [invalidSection] : []),
+  ] : sections;
+  const grouping = hasModules ? `<label>${text("Group by", "分组")} <select id="parallel-grouping"><option value="module" ${byModule ? "selected" : ""}>${text("Module", "模块")}</option><option value="dependency" ${byModule ? "" : "selected"}>${text("Dependencies", "依赖")}</option></select></label>` : "";
+  return `<section id="parallel-board" class="parallel-board" aria-label="${text("Parallel development canvas", "并行开发画布")}"><header class="parallel-heading"><h1>${text("Parallel development plan", "并行开发计划")}</h1><p>${data!.ledger.tasks.length} ${text("tasks · select a card for ownership and evidence", "个任务 · 点卡片查看范围、分工与证据")}</p>${grouping}<div class="parallel-legend">${[
     ["discussion", text("Ready", "待开发")],
     ["confirmed", text("Developing", "开发中")],
-    ["testing", text("Review / integration / handtest", "验收 / 集成 / 手测")],
-    ["passed", text("User accepted", "用户已确认")],
+    ["testing", text("Testing / review / integration / handtest", "测试 / 验收 / 集成 / 手测")],
+    ["passed", text("Completed / user accepted", "已完成 / 用户已确认")],
     ["rework", text("Rework required", "需返工")],
   ]
     .map(
@@ -690,15 +811,11 @@ function renderParallel() {
       "",
     )}</div></header><div id="parallel-viewport" class="parallel-viewport" tabindex="0" aria-label="${text("Task canvas: scroll to zoom, drag to pan, arrow keys to move, +/- zoom, 0 fits.", "任务画布：滚轮缩放，拖动平移；方向键移动，加减键缩放，0 显示全部任务。")}"><div id="parallel-groups" class="parallel-groups" style="transform:translate(${boardView.x}px,${boardView.y}px) scale(${boardView.scale})">${gs
     .map(
-      ([depth, tasks]) =>
-        `<section class="parallel-group" data-parallel-group="${depth}" aria-label="${text("Dependency group", "依赖组")} ${depth + 1}"><header><h2>${depth < 0 ? text("Check dependencies", "待核对依赖") : text(`Group ${depth + 1}`, `第 ${depth + 1} 组`)}</h2><p>${depth < 0 ? text("Missing task references or cyclic dependencies. Resolve before scheduling.", "依赖任务缺失或存在环路，请先核对再派工。") : depth === 0 ? text("No recorded prerequisites. File ownership still determines safe parallelism.", "无已登记前置任务，仍需按文件认领判断是否可并行。") : text("Contains prerequisites in earlier groups. Release each task against its actual dependency evidence.", "包含前序组依赖，须按每项实际依赖和验收证据逐项放行。")}</p></header><div class="parallel-cards">${tasks
-          .sort(
-            (a, b) =>
-              a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id),
-          )
+      ({key, title, description, invalid, tasks}) =>
+        `<section class="parallel-group" data-parallel-group="${esc(key)}" aria-label="${esc(title)}"><header><h2>${esc(title)}</h2>${description ? `<p>${esc(description)}</p>` : ""}</header><div class="parallel-cards">${tasks
           .map(
             (t) =>
-              `<button class="parallel-card stage-${taskStage(t)}" data-parallel-card="${esc(t.id)}" data-cycle="${depth < 0}" aria-pressed="${selectedTask === t.id}"><span class="parallel-card-top"><b>${esc(t.id)}</b><span class="parallel-effort">${t.priority}</span></span><strong>${esc(t.title)}</strong><span class="parallel-tag stage-${taskStage(t)}">${esc(statusLabel(t.status))}</span><span class="parallel-owners"><span>${text("Development", "开发")} ${esc(t.developer || t.owner || text("Unassigned", "未登记"))}</span><span>${text("Review", "验收")} ${esc(t.reviewer || text("Unassigned", "未登记"))}</span></span>${t.description ? `<span class="parallel-note">${esc(t.description.length > 160 ? t.description.slice(0, 159) + "…" : t.description)}</span>` : ""}${t.blocked ? `<span class="parallel-special">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</span>` : ""}<span class="parallel-deps">${text("Prerequisites", "接入前置")}: ${esc(t.dependsOn.join(" / ") || text("None", "无"))}</span>${t.commit ? `<span class="parallel-deps">${text("Commit", "提交")}: ${esc(short(t.commit))}</span>` : ""}</button>`,
+              `<button class="parallel-card stage-${taskStage(t)}" data-parallel-card="${esc(t.id)}" data-cycle="${invalid}" aria-pressed="${selectedTask === t.id}"><span class="parallel-card-top"><b>${esc(t.id)}</b><span class="parallel-effort">${t.priority}</span></span><strong>${esc(t.title)}</strong><span class="parallel-tag stage-${taskStage(t)}">${esc(taskStatusLabel(t))}</span><span class="parallel-owners"><span>${text("Development", "开发")} ${esc(t.developer || t.owner || text("Unassigned", "未登记"))}</span><span>${text("Review", "验收")} ${esc(t.reviewer || text("Unassigned", "未登记"))}</span></span>${t.description ? `<span class="parallel-note">${esc(t.description.length > 160 ? t.description.slice(0, 159) + "…" : t.description)}</span>` : ""}${t.blocked ? `<span class="parallel-special">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</span>` : ""}<span class="parallel-deps">${text("Prerequisites", "接入前置")}: ${esc(t.dependsOn.join(" / ") || text("None", "无"))}</span>${t.commit ? `<span class="parallel-deps">${text("Commit", "提交")}: ${esc(short(t.commit))}</span>` : ""}</button>`,
           )
           .join("")}</div></section>`,
     )
@@ -707,7 +824,7 @@ function renderParallel() {
     )}</div>${!gs.length ? `<div class="map-empty"><h2>${text("Your next task starts here.", "从下一个任务开始。")}</h2><p>${text("Create a task or ask A to break down an Issue. Groups appear from actual dependencies.", "新建任务，或让 A 拆分 Issue。任务会按实际依赖关系分组。")}</p><button id="board-new-task">＋ ${text("New task", "新建任务")}</button></div>` : ""}</div><footer class="parallel-toolbar"><div class="zoom-controls"><button id="parallel-zoom-out" aria-label="${text("Zoom out tasks", "缩小任务画布")}">−</button><output id="parallel-zoom">${Math.round(boardView.scale * 100)}%</output><button id="parallel-zoom-in" aria-label="${text("Zoom in tasks", "放大任务画布")}">＋</button><button id="parallel-fit">${text("Show all tasks", "显示全部任务")}</button><button id="parallel-actual">100%</button></div><span>${text("Scroll to zoom · Drag to pan · Select a card for details", "滚轮缩放 · 拖动平移 · 点击卡片看详情")}</span></footer></section>`;
 }
 function renderUpdates() {
-  return `<div class="task-list-head"><h2>${text("Current work", "本次更新")}</h2><button id="new-task">＋ ${text("New task", "新建任务")}</button></div>${data!.ledger.tasks.length ? data!.ledger.tasks.map((t) => `<article class="update-item ${selectedTask === t.id ? "selected-update" : ""}"><button class="update-select" data-update="${esc(t.id)}"><strong>${esc(t.id)} · ${esc(t.title)}</strong><small>${t.priority} · ${esc(statusLabel(t.status))}</small><span>${esc(t.description.length > 180 ? t.description.slice(0, 179) + "…" : t.description)}</span><span class="update-next">${text("Owner", "认领")}: ${esc(t.owner || text("Unassigned", "未登记"))}${t.commit ? " · " + short(t.commit) : ""}</span></button><button class="update-detail-button" data-update="${esc(t.id)}">${text("Details", "详情")} →</button></article>`).join("") : `<p class="fine">${text("No tasks recorded yet. A can import confirmed Issues or split a request into independently testable tasks.", "暂无任务记录。A 可以导入已确认的 Issue，或将需求拆成可独立验收的任务。")}</p>`}<details class="learning-section"><summary>${text("Source coverage", "源码覆盖情况")}</summary><p class="fine">${snapshot()?.files.length || 0} ${text("files indexed", "个文件已索引")} · ${snapshot()?.modules.length || 0} ${text("modules", "个模块")}</p>${
+  return `<div class="task-list-head"><h2>${text("Current work", "本次更新")}</h2><button id="new-task">＋ ${text("New task", "新建任务")}</button></div>${data!.ledger.tasks.length ? data!.ledger.tasks.map((t) => `<article class="update-item ${selectedTask === t.id ? "selected-update" : ""}"><button class="update-select" data-update="${esc(t.id)}"><strong>${esc(t.id)} · ${esc(t.title)}</strong><small>${t.priority} · ${esc(taskStatusLabel(t))}</small><span>${esc(t.description.length > 180 ? t.description.slice(0, 179) + "…" : t.description)}</span><span class="update-next">${text("Owner", "认领")}: ${esc(t.owner || text("Unassigned", "未登记"))}${t.commit ? " · " + short(t.commit) : ""}</span></button><button class="update-detail-button" data-update="${esc(t.id)}">${text("Details", "详情")} →</button></article>`).join("") : `<p class="fine">${text("No tasks recorded yet. A can import confirmed Issues or split a request into independently testable tasks.", "暂无任务记录。A 可以导入已确认的 Issue，或将需求拆成可独立验收的任务。")}</p>`}<details class="learning-section"><summary>${text("Source coverage", "源码覆盖情况")}</summary><p class="fine">${snapshot()?.files.length || 0} ${text("files indexed", "个文件已索引")} · ${snapshot()?.modules.length || 0} ${text("modules", "个模块")}</p>${
     snapshot()
       ?.warnings.map((w) => `<p class="fine">${esc(w)}</p>`)
       .join("") || ""
@@ -805,7 +922,7 @@ function renderTaskDetail(t: Task | undefined) {
     return `<div class="section-label">${text("A → B → C → you", "A → B → C → 你")}</div><p class="description">${text("A scopes the work. B builds. C reviews independently. After integration, C reviews the integrated version before your handtest.", "A 拆解任务，B 开发，C 独立验收。集成版本再次通过 C 验收后，进入你的手测。")}</p><div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "复制")} ${role}</button>`).join("")}</div><div class="section-label">${text("Ledger revision", "台账版本")}</div><span class="badge">${data?.ledger.revision}</span><p class="small-print">${text("Task states change through explicit handoff events, never from a chat ending.", "任务状态由明确的交接事件更新，不通过聊天结束推断完成。")}</p>`;
   const review = (r: Task["reviews"][number], name: string) =>
     `<div class="review"><b>${name} · ${r.passed ? text("Passed", "通过") : text("Changes requested", "需返工")}</b><br>${esc(r.reviewer)} · ${esc(r.commit)}<br>${esc(r.report)}${r.untested.length ? `<br><span class="pending">${text("Untested", "未覆盖")}: ${esc(r.untested.join(", "))}</span>` : ""}<br><span class="muted">${formatDate(r.at)}</span></div>`;
-  return `<span class="badge">${esc(statusLabel(t.status))}</span> <span class="priority ${t.priority}">${t.priority}</span><p class="description">${esc(t.description)}</p><div class="section-label">${text("Acceptance criteria", "验收标准")}</div><ul>${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul><dl class="task-detail">${[
+  return `<div class="task-detail-heading"><h2>${esc(t.title)}</h2><button id="edit-task">${text("Edit task", "编辑任务")}</button></div><span class="badge">${esc(taskStatusLabel(t))}</span> <span class="priority ${t.priority}">${t.priority}</span><p class="description task-multiline">${esc(t.description)}</p><div class="section-label">${text("Acceptance criteria", "验收标准")}</div><ul>${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul><dl class="task-detail">${[
     [
       text("Task / issue", "任务 / Issue"),
       t.id + (t.issue ? " · " + t.issue : ""),
@@ -820,6 +937,7 @@ function renderTaskDetail(t: Task | undefined) {
         .join(" / ") || "—",
     ],
     [text("Dependencies", "依赖"), t.dependsOn.join(", ") || "—"],
+    ...(t.progress ? [[text("Handoff stage", "交接阶段"), statusLabel(t.status)]] : []),
     [text("Branch", "分支"), t.branch || "—"],
     [text("Base commit", "基线提交"), t.baseCommit || "—"],
     [text("Development commit", "开发提交"), t.commit || "—"],
@@ -828,7 +946,7 @@ function renderTaskDetail(t: Task | undefined) {
     .map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`)
     .join(
       "",
-    )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "验收证据")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C 验收")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "尚无独立验收记录。")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "集成验收")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "用户确认")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "复制")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "编辑 / 提交交接记录")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "验收必须绑定实际提交。只有用户能确认手测通过。")}</p>`;
+    )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "阻塞")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "验收证据")}</div>${t.acceptanceNotes ? `<div class="review"><b>${text("Manual notes", "补充记录")}</b><p class="task-multiline">${esc(t.acceptanceNotes)}</p></div>` : ""}${t.reviews.map((r, i) => review(r, `${text("C review", "C 验收")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "尚无独立验收记录。")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "集成验收")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "用户确认")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "复制")} ${role}</button>`).join("")}</div><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "验收必须绑定实际提交。只有用户能确认手测通过。")}</p>`;
 }
 function locateFile(path: string, files?: string[]) {
   if (!snapshot()?.files.some(file => file.path === path)) {
@@ -904,15 +1022,19 @@ function showJourney(index: number) {
   const trails = j.steps.map(step => moduleTrail(step.moduleId).slice(0, -1));
   const common = trails[0]?.filter(m => trails.every(trail => trail.some(n => n.id === m.id))).at(-1)?.id || "";
   const parent = nextStep ? moduleById(nextStep.moduleId)?.parentId || "" : common;
-  navigateMap(parent);
+  navigateMap(parent, "", false);
   tab = "journeys";
   journeyStep = Math.max(-1, Math.min(j.steps.length - 1, index));
   selectedTask = "";
   selectedModule = journeyStep >= 0 ? j.steps[journeyStep].moduleId : "";
   for (const step of j.steps) {
     const m = moduleById(step.moduleId);
-    if (m) collapsed.delete(m.kind || "source");
+    if (m) {
+      if (!m.parentId && indexedDirectoryCount() && isIndexedDirectory(m)) showIndexedDirectories = true;
+      collapsed.delete(m.kind || "source");
+    }
   }
+  initialFit = true;
   render();
   if (selectedModule) focusModule(selectedModule);
   else fitGraph();
@@ -922,6 +1044,13 @@ function bind() {
     document.getElementById(id)?.addEventListener("click", fn);
   on("map-up", () => navigateMap(callRoot ? mapParent : moduleById(mapParent)?.parentId || ""));
   on("show-call-chain", () => navigateMap(mapParent, selectedModule));
+  on("indexed-directories", () => {
+    showIndexedDirectories = !showIndexedDirectories;
+    if (showIndexedDirectories) collapsed.delete("directory");
+    render();
+    fitGraph();
+    document.getElementById("indexed-directories")?.focus();
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-symbol-target]").forEach(el =>
     el.addEventListener("click", () => { const id = el.dataset.symbolTarget!, m = moduleById(id); if (!m) return; navigateMap(m.parentId || ""); selectedModule = id; render(); focusModule(id); }),
   );
@@ -984,6 +1113,12 @@ function bind() {
     viewMode = "parallel";
     render();
   });
+  document.querySelector<HTMLSelectElement>("#parallel-grouping")?.addEventListener("change", e => {
+    parallelGrouping = (e.target as HTMLSelectElement).value === "dependency" ? "dependency" : "module";
+    render();
+    fitBoard();
+    document.getElementById("parallel-grouping")?.focus();
+  });
   on("dev-map-open", () => {
     viewMode = "map";
     render();
@@ -1044,11 +1179,13 @@ function bind() {
   document
     .querySelector<HTMLSelectElement>("#version-picker")
     ?.addEventListener("change", (e) => {
+      if (layoutSaveTimer !== undefined) rememberMap();
       source = (e.target as HTMLSelectElement).value as typeof source;
       mapParent = "";
       callRoot = "";
       layoutKey = "";
       mapLocations.clear();
+      showIndexedDirectories = false;
       selectedModule = "";
       selectedFile = "";
       selectedJourney = "";
@@ -1150,7 +1287,7 @@ function fitView(
     y: (height - bounds.height * scale) / 2 - bounds.y * scale,
   };
 }
-function zoom(factor: number, x?: number, y?: number, board = false) {
+function zoom(factor: number, x?: number, y?: number, board = false, wheel = false) {
   const current = board ? boardView : view;
   const vp = document.getElementById(board ? "parallel-viewport" : "viewport");
   if (!vp) return;
@@ -1168,7 +1305,11 @@ function zoom(factor: number, x?: number, y?: number, board = false) {
   };
   if (board) boardView = next;
   else view = next;
-  paintView(board);
+  paintView(board, !wheel);
+  if (!board && wheel) {
+    clearTimeout(layoutSaveTimer);
+    layoutSaveTimer = setTimeout(rememberMap, 150);
+  }
 }
 function paintView(board = false, persist = true) {
   if (!board && persist) rememberMap();
@@ -1229,7 +1370,9 @@ function focusModule(id: string) {
     fitGraph();
     return;
   }
-  collapsed.delete(m.kind || "source");
+  const revealDirectory = !showIndexedDirectories && indexedDirectoryCount() && isIndexedDirectory(m);
+  if (revealDirectory) showIndexedDirectories = true;
+  const expanded = collapsed.delete(m.kind || "source");
   const p = nodePos(m);
   view = fitView(
     vp.clientWidth,
@@ -1237,7 +1380,7 @@ function focusModule(id: string) {
     { ...p, width: 316, height: 124 },
     1,
   );
-  render();
+  if (expanded || revealDirectory) render();
   paintView();
 }
 function moveGroup(id: string, dx: number, dy: number) {
@@ -1341,6 +1484,7 @@ function bindCanvas(board = false) {
     const node = (ev.target as Element).closest<HTMLElement>("[data-node]"),
       group = (ev.target as Element).closest<HTMLElement>("[data-drag-group]");
     if (board && (ev.target as Element).closest("button")) return;
+    if (!board && layoutSaveTimer !== undefined) rememberMap();
     if (!node) lastNodeClick = null;
     const current = board ? boardView : view;
     // Fold browser-native focus scrolling into canvas coordinates once.
@@ -1352,12 +1496,12 @@ function bindCanvas(board = false) {
     const points = new Map(layout.flatMap(l=>[...l.positions]));
     const affected = new Set(node ? [node.dataset.node!] :
       layout.find(l=>l.group.id === group?.dataset.dragGroup)?.group.modules.map(m=>m.id) || []);
-    const paths = [...vp.querySelectorAll<SVGPathElement>("path.edge,path.containment")].map(element=>({
+    const paths = affected.size ? [...vp.querySelectorAll<SVGPathElement>("path.edge,path.containment")].map(element=>({
       element, from:element.dataset.from || element.dataset.owner || "",
       to:element.dataset.to || element.dataset.member || "",
       type:element.classList.contains("containment") || element.dataset.route === "type",
       index:Number(element.dataset.routeIndex || 0),
-    })).filter(p=>points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to)));
+    })).filter(p=>points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to))) : [];
     drag = {type:node ? "node" : group ? "group" : "pan",
       id:node?.dataset.node || group?.dataset.dragGroup || "", pointerId:ev.pointerId,
       startX:ev.clientX, startY:ev.clientY, x:ev.clientX, y:ev.clientY,
@@ -1398,6 +1542,7 @@ function bindCanvas(board = false) {
         ev.clientX - rect.left,
         ev.clientY - rect.top,
         board,
+        true,
       );
     },
     { passive: false },
@@ -1764,55 +1909,194 @@ function openRoles(initial = "A") {
 function openTask(task?: Task) {
   if (!data) return;
   const revision = data.ledger.revision;
-  const shell = openModal(
-    task
-      ? text("Submit a task handoff.", "提交任务交接。")
-      : text("Make the next step clear.", "把下一步说清楚。"),
-    `<form id="task-form">${task ? `<p>${text("Edit the complete task record. The service validates ownership, status transitions, exact commits, and independent review evidence. Revision conflicts require reloading.", "编辑完整任务记录。服务会验证认领、状态流转、提交版本和独立验收证据。版本冲突时需要重新载入。")}</p><div class="form-row"><label for="task-json">${text("Versioned task record · JSON", "版本化任务记录 · JSON")}</label><textarea id="task-json" name="task-json" spellcheck="false" style="min-height:330px;font-family:ui-monospace,monospace;font-size:11px">${esc(JSON.stringify(task, null, 2))}</textarea></div>` : `<div class="form-row"><label for="task-title">${text("Task title", "任务标题")}</label><input id="task-title" name="task-title" required maxlength="240" placeholder="${text("What should change?", "需要改变什么？")}"></div><div class="form-row"><label for="task-description">${text("Context & expected behavior", "背景与预期行为")}</label><textarea id="task-description" name="task-description" required></textarea></div><div class="form-grid form-row"><div><label for="task-priority">${text("Priority", "优先级")}</label><select id="task-priority" name="task-priority"><option>P1</option><option>P0</option><option>P2</option></select></div><div><label for="task-issue">${text("Issue URL or reference (optional)", "Issue 地址或编号（可选）")}</label><input id="task-issue" name="task-issue" placeholder="#12"></div></div><div class="form-row"><label for="task-criteria">${text("Acceptance criteria · one per line", "验收标准 · 每行一条")}</label><textarea id="task-criteria" name="task-criteria" required></textarea></div>`}<div class="form-grid form-row"><div><label for="task-actor">${text("Recorded actor", "记录操作者")}</label><input id="task-actor" name="task-actor" value="${task ? "" : "user"}" placeholder="${text("Your role / session identifier", "你的角色 / 会话标识")}" required maxlength="160"></div><div><label>${text("Ledger revision", "台账版本")}</label><p class="description">${revision}</p></div></div><p id="task-error" role="alert" class="description danger"></p><div class="form-actions"><button class="primary" type="submit">${task ? text("Submit handoff", "提交交接") : text("Create task", "创建任务")}</button></div></form>`,
-  );
-  shell.querySelector("#task-form")!.addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    const form = new FormData(ev.target as HTMLFormElement);
-    try {
-      let next: Task;
-      if (task) {
-        next = JSON.parse(String(form.get("task-json")));
-        if (next.id !== task.id)
-          throw new Error(
-            text("Task ID must remain unchanged.", "任务 ID 不能改变。"),
-          );
-      } else {
-        next = {
-          id: `TASK-${crypto.randomUUID().slice(0, 8)}`,
-          title: String(form.get("task-title")).trim(),
-          description: String(form.get("task-description")).trim(),
-          priority: form.get("task-priority") as Task["priority"],
-          status: "todo",
-          criteria: String(form.get("task-criteria"))
-            .split("\n")
-            .map((s) => s.trim())
-            .filter(Boolean),
-          dependsOn: [],
-          files: [],
-          reviews: [],
-          updatedAt: new Date().toISOString(),
-        };
-        const issue = String(form.get("task-issue") || "").trim();
-        if (issue) next.issue = issue;
+  const currentStatus = task?.status || "todo";
+  const input = (field: string, label: string, value = "", attributes = "") =>
+    `<label for="task-${field}">${label}</label><input id="task-${field}" name="task-${field}" value="${esc(value)}" ${attributes}>`;
+  const textarea = (field: string, label: string, value = "", attributes = "") =>
+    `<label for="task-${field}">${label}</label><textarea id="task-${field}" name="task-${field}" ${attributes}>${esc(value)}</textarea>`;
+  const options = (values: string[], value: string, label: (option: string) => string) =>
+    values.map(option => `<option value="${esc(option)}" ${value === option ? "selected" : ""}>${esc(label(option))}</option>`).join("");
+  const shell = openModal(task ? text("Edit task", "编辑任务") : text("New task", "新建任务"), `
+    <form id="task-form">
+      ${task ? `<p class="fine">${esc(task.id)}</p>` : ""}
+      <div class="form-row">${input("title", text("Task title", "任务名称"), task?.title, 'required maxlength="240"')}</div>
+      <div class="form-grid form-row">
+        <div>${input("module", text("Module (optional)", "所属模块（可选）"), task?.module, 'maxlength="80"')}</div>
+        <div><label for="task-priority">${text("Priority", "优先级")}</label><select id="task-priority" name="task-priority">${options(["P1", "P0", "P2"], task?.priority || "P1", value => value)}</select></div>
+      </div>
+      ${task ? `
+        <div class="form-grid form-row">
+          <div><label for="task-progress">${text("Board status", "看板状态")}</label><select id="task-progress" name="task-progress">${options(["", ...taskProgressOptions], task.progress || "", value => value ? progressLabel(value) : text("Follow handoff stage", "跟随交接阶段"))}</select></div>
+          <div>${input("branch", text("Branch", "分支"), task.branch)}</div>
+        </div>
+        <p id="task-scope-help" class="fine" hidden>${text("The review scope is frozen. Restart development from rework to revise it.", "验收范围已锁定。退回返工并重新开发时可修订。")}</p>
+      ` : ""}
+      <div class="form-row">${textarea("description", text("Task description", "任务描述"), task?.description, task ? "" : "required")}</div>
+      <div class="form-row">${textarea("criteria", text("Acceptance criteria · one per line", "验收标准 · 每行一条"), task?.criteria.join("\n"), task ? "" : "required")}</div>
+      <div class="form-row">${textarea("acceptance-notes", text("Acceptance evidence · notes", "验收证据 · 补充记录"), task?.acceptanceNotes, 'maxlength="12000"')}</div>
+      ${task ? `
+        <details id="task-assignment" class="form-row">
+          <summary>${text("Ownership, scope & references", "分工、范围和参考")}</summary>
+          <div class="form-grid form-row">
+            <div>${input("owner", text("Owner", "认领人"), task.owner)}</div>
+            <div>${input("developer", text("Developer", "开发者"), task.developer)}</div>
+            <div>${input("reviewer", text("Assigned reviewer", "验收人"), task.reviewer)}</div>
+            <div>${input("base-commit", text("Base commit", "基线提交"), task.baseCommit)}</div>
+            <div>${input("issue", text("Issue reference", "Issue 编号或地址"), task.issue)}</div>
+            <div>${input("blocked", text("Blocker", "阻塞说明"), task.blocked)}</div>
+          </div>
+          <div class="form-row">${textarea("files", text("File scope · one per line", "文件范围 · 每行一条"), task.files.join("\n"))}</div>
+          <div class="form-row">${textarea("depends-on", text("Prerequisite IDs · one per line", "前置任务 ID · 每行一条"), task.dependsOn.join("\n"))}</div>
+        </details>
+        <details id="task-workflow" class="form-row">
+          <summary>${text("A/B/C handoff", "A/B/C 交接")} · ${esc(statusLabel(currentStatus))}</summary>
+          <div class="form-row"><label for="task-status">${text("Handoff stage", "交接阶段")}</label><select id="task-status" name="task-status">${options([currentStatus, ...taskTransitions[currentStatus]], currentStatus, statusLabel)}</select></div>
+          <fieldset id="task-freeze-step" class="task-transition" hidden disabled>
+            <div class="form-row">${input("version", "", "", 'required pattern="[0-9a-fA-F]{40}" maxlength="40" spellcheck="false"')}</div>
+          </fieldset>
+          <fieldset id="task-review-step" class="task-transition" hidden disabled>
+            <p class="fine">${text("Review commit", "验收提交")} <code>${esc(currentStatus === "integration-review" ? task.integrationCommit : task.commit)}</code></p>
+            <div class="form-row">${textarea("review-report", text("Independent review report", "独立验收报告"), "", "required")}</div>
+            <div class="form-row">${textarea("untested", text("Untested items · one per line", "未验证项 · 每行一条"))}</div>
+          </fieldset>
+          <fieldset id="task-handtest-step" class="task-transition" hidden disabled>
+            <p class="fine">${text("Handtest commit", "手测提交")} <code>${esc(task.integrationCommit)}</code></p>
+            <div class="form-row">${textarea("handtest-source", text("User handtest result and evidence", "用户手测结果及依据"), "", "required")}</div>
+          </fieldset>
+        </details>
+      ` : `<div class="form-row">${input("issue", text("Issue reference (optional)", "Issue 编号或地址（可选）"))}</div>`}
+      <div class="form-row">${input("actor", text("Recorded actor", "记录操作者"), "user", 'required maxlength="160"')}</div>
+      <p id="task-error" role="alert" class="description danger"></p>
+      <div class="form-actions">
+        <button type="button" id="task-cancel">${text("Cancel", "取消")}</button>
+        <button class="primary" type="submit">${task ? text("Save changes", "保存修改") : text("Create task", "创建任务")}</button>
+      </div>
+    </form>`);
+  const form = shell.querySelector<HTMLFormElement>("#task-form")!;
+  const workflow = form.querySelector<HTMLSelectElement>("#task-status");
+  const actorField = form.querySelector<HTMLInputElement>("#task-actor")!;
+  form.addEventListener("invalid", event => {
+    const details = (event.target as HTMLElement).closest("details");
+    if (details) details.open = true;
+  }, true);
+  const workflowStatus = () => (workflow?.value || currentStatus) as TaskStatus;
+  const isReview = () =>
+    workflowStatus() !== currentStatus && (currentStatus === "review" || currentStatus === "integration-review");
+  let customActor = false;
+  actorField.addEventListener("input", () => { customActor = true; });
+  if (task && workflow) {
+    const step = (name: string, visible: boolean) => {
+      const fieldset = form.querySelector<HTMLFieldSetElement>(`#task-${name}-step`)!;
+      fieldset.hidden = !visible;
+      fieldset.disabled = !visible;
+    };
+    const syncStatus = () => {
+      const next = workflowStatus();
+      const advancing = currentStatus !== next;
+      const scopeEditable = canEditTaskScope(currentStatus, next);
+      const owner = form.querySelector<HTMLInputElement>("#task-owner")!;
+      const developer = form.querySelector<HTMLInputElement>("#task-developer")!;
+      developer.readOnly = currentStatus !== "todo" && !(currentStatus === "rework" && next === "developing");
+      for (const name of ["description", "criteria", "files", "depends-on"]) {
+        form.querySelector<HTMLTextAreaElement>(`#task-${name}`)!.readOnly = !scopeEditable;
       }
-      await api("/api/tasks", {
-        revision,
-        actor: String(form.get("task-actor")).trim(),
-        task: next,
+      form.querySelector<HTMLElement>("#task-scope-help")!.hidden = scopeEditable;
+      step("freeze", advancing && (next === "review" || next === "integrated"));
+      form.querySelector('label[for="task-version"]')!.textContent = next === "integrated"
+        ? text("Integration commit · full SHA", "集成提交 · 完整 SHA")
+        : text("Development commit · full SHA", "开发提交 · 完整 SHA");
+      step("review", isReview());
+      step("handtest", advancing && next === "done");
+      if (!customActor) {
+        actorField.value = isReview() ? "" : !advancing || next === "done" ? "user" : owner.value || "user";
+      }
+      if (advancing && next === "developing") {
+        form.querySelector<HTMLDetailsElement>("#task-assignment")!.open = true;
+        owner.placeholder = actorField.value;
+        developer.placeholder = owner.value || actorField.value;
+      }
+    };
+    workflow.addEventListener("change", syncStatus);
+    syncStatus();
+  }
+  shell.querySelector("#task-cancel")!.addEventListener("click", closeModal);
+  const submit = form.querySelector<HTMLButtonElement>('[type="submit"]')!;
+  const message = form.querySelector<HTMLElement>("#task-error")!;
+  const initial = new FormData(form);
+  form.addEventListener("submit", async ev => {
+    ev.preventDefault();
+    if (submit.disabled) return;
+    submit.disabled = true;
+    message.textContent = "";
+    const values = new FormData(form);
+    const value = (name: string) => String(values.get(`task-${name}`) ?? "").trim();
+    const lines = (name: string) => value(name).split("\n").map(line => line.trim()).filter(Boolean);
+    const changed = (name: string) => values.get(`task-${name}`) !== initial.get(`task-${name}`);
+    const edited = (name: string, previous?: string) => !task || changed(name) ? value(name) || undefined : previous;
+    const actor = value("actor");
+    const at = new Date().toISOString();
+    const next: Task = {
+      ...(task || { id: `TASK-${crypto.randomUUID().slice(0, 8)}`, criteria: [], files: [], dependsOn: [], reviews: [] }),
+      title: edited("title", task?.title) || "",
+      module: edited("module", task?.module),
+      priority: value("priority") as Task["priority"],
+      status: workflowStatus(),
+      description: task?.description || "",
+      acceptanceNotes: edited("acceptance-notes", task?.acceptanceNotes),
+      issue: edited("issue", task?.issue),
+      updatedAt: at,
+    };
+    if (canEditTaskScope(currentStatus, next.status)) {
+      next.description = edited("description", task?.description) || "";
+      if (!task || changed("criteria")) next.criteria = lines("criteria");
+      if (!task || changed("files")) next.files = lines("files");
+      if (!task || changed("depends-on")) next.dependsOn = lines("depends-on");
+    }
+    if (task) {
+      if (changed("progress")) next.progress = (value("progress") || null) as TaskProgress | null;
+      Object.assign(next, {
+        branch: edited("branch", task.branch),
+        owner: edited("owner", task.owner),
+        developer: edited("developer", task.developer),
+        reviewer: edited("reviewer", task.reviewer),
+        baseCommit: edited("base-commit", task.baseCommit),
+        blocked: edited("blocked", task.blocked),
       });
+      if (currentStatus !== next.status) {
+        if (next.status === "developing") {
+          next.owner ||= actor;
+          next.developer ||= next.owner;
+        }
+        if (next.status === "review") next.commit = value("version");
+        if (next.status === "integrated") next.integrationCommit = value("version");
+        if (isReview()) {
+          const review = {
+            reviewer: actor,
+            commit: (currentStatus === "integration-review" ? task.integrationCommit : task.commit)!,
+            passed: next.status !== "rework",
+            report: value("review-report"),
+            untested: lines("untested"),
+            at,
+          };
+          if (currentStatus === "integration-review") next.integrationReview = review;
+          else next.reviews = [...task.reviews, review];
+        }
+        if (next.status === "done") {
+          next.userAcceptance = { commit: task.integrationCommit!, source: value("handtest-source"), at };
+        }
+      }
+    }
+    try {
+      await api("/api/tasks", { revision, actor, task: next });
       selectedTask = next.id;
-      viewMode = "parallel";
-      closeModal();
+      if (!task) viewMode = "parallel";
+      if (shell.isConnected) closeModal();
       await refresh();
       toast(text("Task ledger updated.", "任务台账已更新。"));
     } catch (e) {
-      shell.querySelector("#task-error")!.textContent =
-        e instanceof Error ? e.message : String(e);
+      message.textContent = e instanceof Error ? e.message : String(e);
+    } finally {
+      submit.disabled = false;
     }
   });
 }
@@ -1864,4 +2148,7 @@ events.onopen = () => {
 };
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) void refresh();
+});
+window.addEventListener("pagehide", () => {
+  if (layoutSaveTimer !== undefined) rememberMap();
 });

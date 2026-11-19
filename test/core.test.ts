@@ -215,9 +215,18 @@ test("ledger CAS rejects stale writes and file ownership conflicts", async () =>
     });
     state = updateTask(root, state.revision, "A", {
       ...task("T2"),
+      progress: "done",
       files: ["src/"],
     });
     assert.equal(state.tasks.length, 2); // Pending scopes may overlap until claimed.
+    const { progress, ...legacyTask } = state.tasks[1];
+    state = updateTask(root, state.revision, "A", legacyTask);
+    assert.equal(state.tasks[1].progress, progress);
+    assert.equal(state.tasks[1].status, "todo");
+    assert.throws(
+      () => updateTask(root, state.revision, "user", { ...state.tasks[0], dependsOn: ["T2"] }),
+      /Dependency T2 has not passed acceptance/,
+    );
   } finally {
     await clean();
   }
@@ -262,6 +271,12 @@ test("ledger preserves independent review, integrated SHA, and explicit user gat
       /review/i,
     );
     set("C", { status: "passed", reviews: [{ ...review, reviewer: "C" }] });
+    set("user", { title: "Corrected title", acceptanceNotes: "Supplementary evidence" });
+    assert.equal(state.tasks[0].reviews[0].report, review.report);
+    assert.throws(
+      () => set("user", { criteria: ["Changed after review"] }),
+      /scope is frozen/,
+    );
     assert.throws(
       () => set("B", { reviews: [] }),
       /Historical|independent review/,

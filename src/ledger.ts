@@ -1,32 +1,9 @@
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import type { Ledger, Task, TaskStatus, Review } from "./types.ts";
-const statuses: TaskStatus[] = [
-  "todo",
-  "developing",
-  "review",
-  "rework",
-  "passed",
-  "integrated",
-  "integration-review",
-  "integration-passed",
-  "handtest",
-  "done",
-];
+import { taskProgressOptions, type Ledger, type Task, type Review } from "./types.ts";
+import { canEditTaskScope, taskTransitions } from "./task-workflow.ts";
 const sha = /^[0-9a-f]{40}$/i;
-const transitions: Record<TaskStatus, TaskStatus[]> = {
-  todo: ["developing"],
-  developing: ["review"],
-  review: ["passed", "rework"],
-  rework: ["developing", "review"],
-  passed: ["integrated", "rework"],
-  integrated: ["integration-review"],
-  "integration-review": ["integration-passed", "rework"],
-  "integration-passed": ["handtest", "rework"],
-  handtest: ["done", "rework"],
-  done: [],
-};
 const empty = (): Ledger => ({
   schemaVersion: 1,
   revision: 0,
@@ -118,8 +95,19 @@ function validateTask(task: Task) {
     typeof task.title === "string" && task.title.trim(),
     "Task title required.",
   );
+  assert(
+    task.module === undefined ||
+      (typeof task.module === "string" && task.module.trim() && task.module.length <= 80),
+    "Task module must contain 1–80 characters.",
+  );
   assert(["P0", "P1", "P2"].includes(task.priority), "Invalid priority.");
-  assert(statuses.includes(task.status), "Invalid task status.");
+  assert(Object.hasOwn(taskTransitions, task.status), "Invalid task status.");
+  assert(task.progress == null || taskProgressOptions.includes(task.progress), "Invalid board status.");
+  assert(
+    task.acceptanceNotes === undefined ||
+      (typeof task.acceptanceNotes === "string" && task.acceptanceNotes.length <= 12000),
+    "Acceptance notes must contain at most 12000 characters.",
+  );
   assert(
     Array.isArray(task.files) &&
       Array.isArray(task.criteria) &&
@@ -243,13 +231,10 @@ export function writeLedger(
       if (before) {
         if (before.status !== task.status)
           assert(
-            transitions[before.status].includes(task.status),
+            taskTransitions[before.status].includes(task.status),
             `Invalid transition ${before.status} → ${task.status}.`,
           );
-        if (
-          before.status !== "todo" &&
-          !(before.status === "rework" && task.status === "developing")
-        )
+        if (!canEditTaskScope(before.status, task.status))
           for (const field of [
             "description",
             "criteria",
@@ -346,7 +331,8 @@ export function writeLedger(
       const advancing =
         !before ||
         (before.status !== task.status && !["rework"].includes(task.status));
-      if (!advancing) continue;
+      const dependenciesChanged = JSON.stringify(task.dependsOn) !== JSON.stringify(before?.dependsOn);
+      if (!advancing && !dependenciesChanged) continue;
       for (const dep of task.dependsOn) {
         const dependency = next.tasks.find((t) => t.id === dep);
         assert(
@@ -389,7 +375,10 @@ export function updateTask(
 ): Ledger {
   assert(actor?.trim(), "Actor required.");
   const ledger = readLedger(root);
-  const previous = ledger.tasks.find((t) => t.id === task.id);
+  const index = ledger.tasks.findIndex((t) => t.id === task.id);
+  const previous = ledger.tasks[index];
+  if (task.progress === undefined && previous?.progress !== undefined)
+    task = { ...task, progress: previous.progress };
   if (task.status === "integrated" && previous?.status !== "integrated")
     task = { ...task, integrator: actor };
   if (
@@ -422,7 +411,9 @@ export function updateTask(
     );
     for (const field of [
       "title",
+      "module",
       "priority",
+      "progress",
       "description",
       "criteria",
       "dependsOn",
@@ -459,7 +450,8 @@ export function updateTask(
     previous &&
     previous.status !== "todo" &&
     task.status === previous.status &&
-    actor !== previous.owner
+    actor !== previous.owner &&
+    actor !== "user"
   ) {
     assert(
       actor === task.reviewer ||
@@ -521,8 +513,8 @@ export function updateTask(
     ...structuredClone(task),
     updatedAt: new Date().toISOString(),
   };
-  ledger.tasks = ledger.tasks.filter((t) => t.id !== task.id);
-  ledger.tasks.push(updated);
+  if (previous) ledger.tasks[index] = updated;
+  else ledger.tasks.push(updated);
   ledger.events.push({
     at: updated.updatedAt,
     taskId: task.id,

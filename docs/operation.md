@@ -40,6 +40,10 @@ The running service debounces changes for 10 seconds and reconciles every 60 sec
 
 服务默认合并连续 10 秒内的修改，每 60 秒检查遗漏。每个工作区的语义分析串行运行，默认最短间隔 5 分钟，每日调用上限可配置；源码无变化不发起分析。任务事件直接刷新看板，无需架构分析。
 
+Live watching registers individual directories in the configured Java source scopes, or indexed source directories when Java scopes are disabled. Scanner exclusions and `src/test` are applied before registration; packages named `test` under `src/main` remain included. Scans update the watcher set as source directories change. Watcher failures retain periodic reconciliation and are retried on the next scan.
+
+实时监听逐目录注册到配置的 Java 源码范围；未启用 Java 范围时，监听已索引源码所在目录。注册前应用扫描排除规则并排除 `src/test`，保留 `src/main` 下名为 `test` 的业务包。扫描会随源码目录变化更新监听集合；监听失败仍保留定期扫描，并在下次扫描时重试。
+
 Without an enabled adapter, `analyze` writes an analysis request for a session agent. See [the analysis protocol](../skills/nativue/references/analysis.md). For unattended updates, configure `.nativue/config.json` with `analysis.enabled`, an executable argument array in `analysis.command`, `minIntervalMs`, and `maxCallsPerDay`. Use a command you trust and have tested. Nativue supplies JSON on stdin and expects exact response JSON on stdout; no shell expansion occurs. The selected provider's permissions, costs and data policy apply.
 
 未启用适配器时，`analyze` 生成分析请求，由会话 Agent 处理，详见[分析协议](../skills/nativue/references/analysis.md)。无人值守更新需在本地配置中设置 `analysis.enabled`、命令参数数组 `analysis.command`、`minIntervalMs` 和 `maxCallsPerDay`。命令必须由用户选择并验证；stdin 接收 JSON，stdout 输出完整响应 JSON，不执行 shell 展开。模型提供商的权限、费用和数据政策仍然适用。
@@ -77,6 +81,10 @@ With remote sync configured, this reads up to 500 open public GitHub Issues, exc
 配置远端后，最多读取 500 个公开仓库未关闭 Issue，排除 PR，新增缺失的 `todo` 任务并保留已有任务。P0/P1/P2 标签忽略大小写匹配，其他默认 P2。不生成虚假验收标准，也不自动开始开发；B 开始前由 A 确认范围和标准。本候选版尚未实现自定义标签映射、私有 Issue 认证及远端回写。GitHub API 限流可能中断导入，重试保留已导入任务。
 
 ## Task writes / 任务写入
+
+Select a card and choose Edit task to update its fields. Board status can be set directly or follow the A/B/C handoff stage. Prerequisite acceptance, independent reviews, and handtest results use the handoff records and their frozen commits. Scope can be revised until submission for review. Supplementary notes can be edited throughout the task.
+
+选中卡片后，点击「编辑任务」修改字段。看板状态可直接设置，也可跟随 A/B/C 交接阶段。前置任务放行、独立验收和手测结果以交接记录及其冻结提交为准。提交验收前可修订范围，补充证据可随时编辑。
 
 ```sh
 node bin/nativue.js task /path/to/task.json /path/to/workspace --revision 0 --actor A

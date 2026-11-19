@@ -81,7 +81,7 @@ async function git(root: string, args: string[]): Promise<string> {
     )
   ).stdout;
 }
-function allowed(file: string, extra: string[] = [], javaRoots: string[] = [], directory = false): boolean {
+export function isSourcePathAllowed(file: string, extra: string[] = [], javaRoots: string[] = [], directory = false): boolean {
   const sourceRoot = /(?:^|\/)src\/main\/java\//.exec(file);
   const packageStart = sourceRoot ? file.slice(0, sourceRoot.index + sourceRoot[0].length).split("/").length - 1 : Infinity;
   // Selected Java packages named runtime/build are source, not runtime data or build output.
@@ -128,7 +128,7 @@ async function walk(root: string, limit = 10000, javaRoots: string[] = []): Prom
     )) {
       if (found.length >= limit) return;
       const name = slash(path.relative(root, path.join(dir, e.name)));
-      if (!allowed(name, [], javaRoots, e.isDirectory()) || e.isSymbolicLink()) continue;
+      if (!isSourcePathAllowed(name, [], javaRoots, e.isDirectory()) || e.isSymbolicLink()) continue;
       if (e.isDirectory()) await visit(path.join(dir, e.name));
       else if (e.isFile()) found.push(name);
     }
@@ -237,7 +237,7 @@ export async function scanWorkspace(
       (p) =>
         !path.isAbsolute(p) &&
         !p.split("/").includes("..") &&
-        allowed(p, extra, javaRoots),
+        isSourcePathAllowed(p, extra, javaRoots),
     )
     .sort((a,b) => {
       const selected = (file: string) => javaRoots.some(r=>file === r || file.startsWith(r.replace(/\/$/, "") + "/"));

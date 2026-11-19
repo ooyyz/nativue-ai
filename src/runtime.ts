@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import type { RuntimeState, Snapshot } from "./types.ts";
-import { scanWorkspace } from "./scanner.ts";
+import { isSourcePathAllowed, scanWorkspace } from "./scanner.ts";
 import { syncRemote } from "./remote.ts";
 import { syncIssues } from "./issues.ts";
 import {
@@ -18,7 +18,7 @@ export class Runtime {
   root: string;
   state: RuntimeState;
   listeners = new Set<() => void>();
-  watcher: fs.FSWatcher | null = null;
+  watchers = new Map<string, fs.FSWatcher>();
   timers: ReturnType<typeof setInterval>[] = [];
   pending: ReturnType<typeof setTimeout> | null = null;
   scanning = false;
@@ -64,7 +64,12 @@ export class Runtime {
     } finally {
       this.scanPromise = null;
       this.scanning = false;
-      if (!this.closed) this.emit();
+      if (!this.closed) {
+        if (this.state.running) {
+          this.refreshWatchers();
+        }
+        this.emit();
+      }
     }
   }
   private async performScan() {
@@ -259,32 +264,120 @@ export class Runtime {
       if (!this.closed) this.emit();
     }
   }
+  private refreshWatchers() {
+    const config = readConfig(this.root);
+    const base = fs.realpathSync(this.root);
+    const roots = config.java?.enabled
+      ? [config.java, ...(config.java.scopes || [])]
+        .flatMap(scope => scope.roots)
+        .map(root => path.posix.normalize(root).replace(/\/$/, ""))
+      : [];
+    const directories = new Set<string>();
+    const traversed = new Set<string>();
+    const watchError = "Source watching incomplete; periodic reconciliation remains active / 部分源码监听不可用，定期扫描仍在运行";
+    if (this.state.error === watchError) {
+      this.state.error = undefined;
+    }
+    const unavailable = () => {
+      this.state.error = watchError;
+    };
+    const accepts = (relative: string) => {
+      return isSourcePathAllowed(relative, config.exclude, roots, true) &&
+        !/(?:^|\/)src\/test(?:\/|$)/.test(relative);
+    };
+    const visit = (relative: string, descend: boolean) => {
+      if (!accepts(relative) || (descend ? traversed.has(relative) : directories.has(relative))) {
+        return;
+      }
+      try {
+        const absolute = path.join(base, relative);
+        if (fs.realpathSync(absolute) !== absolute) {
+          return;
+        }
+        const stat = fs.lstatSync(absolute);
+        if (stat.isSymbolicLink()) {
+          return;
+        }
+        if (!stat.isDirectory()) {
+          visit(path.posix.dirname(relative), false);
+          return;
+        }
+        directories.add(relative);
+        if (descend) {
+          traversed.add(relative);
+          for (const entry of fs.readdirSync(absolute, { withFileTypes: true })) {
+            if (entry.isDirectory() && !entry.isSymbolicLink()) {
+              visit(path.posix.join(relative, entry.name), true);
+            }
+          }
+        }
+      } catch (error) {
+        // 保存或移动目录期间路径可能消失，下次扫描重新建立监听。
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+          unavailable();
+        }
+      }
+    };
+    if (roots.length) {
+      for (const root of roots) {
+        const file = root.endsWith(".java");
+        visit(file ? path.posix.dirname(root) : root, !file);
+      }
+    } else {
+      for (const file of readSnapshot(this.root)?.files || []) {
+        if (accepts(file.path)) {
+          const directory = path.posix.dirname(file.path);
+          visit(directory, directory !== ".");
+        }
+      }
+    }
+    for (const [directory, watcher] of this.watchers) {
+      if (!directories.has(directory)) {
+        watcher.close();
+        this.watchers.delete(directory);
+      }
+    }
+    for (const directory of directories) {
+      if (this.watchers.has(directory)) {
+        continue;
+      }
+      try {
+        // 逐目录注册，避免 recursive 在过滤前已监听构建产物和整个工程。
+        const watcher = fs.watch(path.join(base, directory), (_, file) => {
+          const relative = path.posix.join(directory, String(file || "").replaceAll("\\", "/"));
+          if (this.closed || this.state.paused || !accepts(relative)) {
+            return;
+          }
+          if (roots.length && !roots.some(root => root === "." || relative === root ||
+            relative.startsWith(root + "/") || root.startsWith(relative + "/"))) {
+            return;
+          }
+          if (this.pending) {
+            clearTimeout(this.pending);
+          }
+          this.pending = setTimeout(() => {
+            this.pending = null;
+            void this.scan().then(() => this.analyze()).catch(() => {});
+          }, readConfig(this.root).refresh.debounceMs);
+        });
+        watcher.on("error", () => {
+          watcher.close();
+          this.watchers.delete(directory);
+          if (!this.closed) {
+            unavailable();
+            this.emit();
+          }
+        });
+        this.watchers.set(directory, watcher);
+      } catch {
+        unavailable();
+      }
+    }
+  }
   async start() {
     this.state.running = true;
     await this.scan(true);
     if (this.closed) return;
-    try {
-      this.watcher = fs.watch(this.root, { recursive: true }, (_, file) => {
-        const rel = String(file || "").replaceAll("\\", "/");
-        if (
-          rel.startsWith(".nativue/") ||
-          rel.startsWith(".git/") ||
-          /(^|\/)(node_modules|dist|build|\.next)(\/|$)/.test(rel) ||
-          this.state.paused ||
-          this.closed
-        )
-          return;
-        if (this.pending) clearTimeout(this.pending);
-        this.pending = setTimeout(() => {
-          void this.scan()
-            .then(() => this.analyze())
-            .catch(() => {});
-        }, readConfig(this.root).refresh.debounceMs);
-      });
-    } catch {
-      this.state.error =
-        "File watching unavailable; periodic reconciliation remains active";
-    }
     this.timers.push(
       setInterval(() => {
         if (this.closed || this.state.paused) return;
@@ -324,7 +417,10 @@ export class Runtime {
   async close() {
     if (this.closed) return;
     this.closed = true;
-    this.watcher?.close();
+    for (const watcher of this.watchers.values()) {
+      watcher.close();
+    }
+    this.watchers.clear();
     this.timers.forEach(clearInterval);
     if (this.pending) clearTimeout(this.pending);
     this.analysisAbort?.abort();

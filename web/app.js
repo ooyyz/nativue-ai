@@ -66,6 +66,26 @@ function codeHierarchy(modules, edges, columns = 2) {
   return { positions, parents, families, width: count * laneWidth - 24, height: Math.max(0, ...bottoms) };
 }
 
+// src/task-workflow.ts
+var taskTransitions = {
+  todo: ["developing"],
+  developing: ["review"],
+  review: ["passed", "rework"],
+  rework: ["developing", "review"],
+  passed: ["integrated", "rework"],
+  integrated: ["integration-review"],
+  "integration-review": ["integration-passed", "rework"],
+  "integration-passed": ["handtest", "rework"],
+  handtest: ["done", "rework"],
+  done: []
+};
+function canEditTaskScope(current, next) {
+  return current === "todo" || current === "developing" || current === "rework" && next === "developing";
+}
+
+// src/types.ts
+var taskProgressOptions = ["todo", "developing", "testing", "done"];
+
 // web/app.ts
 var app = document.querySelector("#app");
 var esc = (value) => String(value ?? "").replace(
@@ -77,6 +97,7 @@ var lang = localStorage.getItem("nativue-language") || "";
 var source = "local";
 var tab = "updates";
 var viewMode = "map";
+var parallelGrouping = "module";
 var selectedModule = "";
 var selectedTask = "";
 var selectedJourney = "";
@@ -89,8 +110,10 @@ var mapParent = "";
 var callRoot = "";
 var layoutKey = "";
 var mapQuery = "";
+var showIndexedDirectories = false;
 var canvasGestureActive = false;
 var canvasRenderPending = false;
+var layoutSaveTimer;
 var mapLocations = /* @__PURE__ */ new Map();
 var modal = "";
 var modalCleanup;
@@ -122,17 +145,42 @@ var labels = {
   done: ["Accepted", "\u7528\u6237\u5DF2\u786E\u8BA4"]
 };
 var statusLabel = (s) => labels[s] ? text(...labels[s]) : s;
+var progressLabel = (status) => status === "testing" ? text("Ready for testing", "\u5F85\u6D4B\u8BD5") : status === "done" ? text("Completed", "\u5DF2\u5B8C\u6210") : statusLabel(status);
+var taskStatusLabel = (task) => task.progress ? progressLabel(task.progress) : statusLabel(task.status);
 var snapshot = () => data ? source === "remote" ? data.remote : data.local : null;
-var moduleById = (id) => snapshot()?.modules.find((m) => m.id === id);
-var childModules = (id) => snapshot()?.modules.filter((m) => (m.parentId || "") === id) || [];
+var graphIndexes = /* @__PURE__ */ new WeakMap();
+function graphIndex() {
+  const s = snapshot();
+  if (!s) return void 0;
+  const cached = graphIndexes.get(s);
+  if (cached) return cached;
+  const index = { modules: /* @__PURE__ */ new Map(), children: /* @__PURE__ */ new Map(), incidentEdges: /* @__PURE__ */ new Map() };
+  for (const module of s.modules) {
+    index.modules.set(module.id, module);
+    const parent = module.parentId || "";
+    if (!index.children.has(parent)) index.children.set(parent, []);
+    index.children.get(parent).push(module);
+  }
+  for (const edge of s.edges) {
+    for (const id of edge.from === edge.to ? [edge.from] : [edge.from, edge.to]) {
+      if (!index.incidentEdges.has(id)) index.incidentEdges.set(id, []);
+      index.incidentEdges.get(id).push(edge);
+    }
+  }
+  graphIndexes.set(s, index);
+  return index;
+}
+var moduleById = (id) => graphIndex()?.modules.get(id);
+var childModules = (id) => graphIndex()?.children.get(id) || [];
 function callChainModules() {
   const ids = /* @__PURE__ */ new Set([callRoot]), queue = [{ id: callRoot, depth: 0 }];
-  const calls = snapshot()?.edges.filter((e) => e.relation === "calls") || [];
+  const incidentEdges = graphIndex()?.incidentEdges;
   for (let i = 0; i < queue.length; i++) {
     const { id, depth } = queue[i];
     if (depth >= 2) continue;
-    for (const e of calls) {
-      const next = e.from === id ? e.to : e.to === id ? e.from : "";
+    for (const e of incidentEdges?.get(id) || []) {
+      if (e.relation !== "calls") continue;
+      const next = e.from === id ? e.to : e.from;
       if (next && !ids.has(next) && ids.size < 80) {
         ids.add(next);
         queue.push({ id: next, depth: depth + 1 });
@@ -141,9 +189,24 @@ function callChainModules() {
   }
   return snapshot()?.modules.filter((m) => ids.has(m.id)) || [];
 }
-var visibleMapModules = () => (callRoot ? callChainModules() : childModules(mapParent)).filter((m) => !mapQuery || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(mapQuery.toLowerCase()));
+var isIndexedDirectory = (m) => m.kind === "directory" && /^(?:scan-)?module-[0-9a-f]{12}$/.test(m.id);
+function indexedDirectoryCount() {
+  if (mapParent || callRoot) return 0;
+  const roots = childModules("");
+  const count = roots.filter(isIndexedDirectory).length;
+  return count < roots.length ? count : 0;
+}
+function visibleMapModules() {
+  const hideIndexedDirectories = !showIndexedDirectories && indexedDirectoryCount() > 0;
+  const query = mapQuery.toLowerCase();
+  return (callRoot ? callChainModules() : childModules(mapParent)).filter(
+    (m) => (!hideIndexedDirectories || !isIndexedDirectory(m)) && (!query || `${m.name} ${m.symbol || ""}`.toLowerCase().includes(query))
+  );
+}
 var scopeKey = () => mapParent + (callRoot ? "#calls:" + callRoot : "");
 function rememberMap() {
+  clearTimeout(layoutSaveTimer);
+  layoutSaveTimer = void 0;
   mapLocations.set(scopeKey(), {
     view: { ...view },
     selectedModule,
@@ -151,7 +214,8 @@ function rememberMap() {
     nodes: new Map(nodePositions),
     groups: new Map(groupPositions),
     collapsed: new Set(collapsed),
-    query: mapQuery
+    query: mapQuery,
+    showIndexedDirectories
   });
   if (!layoutKey) return;
   try {
@@ -184,7 +248,8 @@ function restoreMap() {
       view = { ...location.view };
       selectedModule = location.selectedModule;
       mapQuery = location.query || "";
-      initialFit = true;
+      showIndexedDirectories = location.showIndexedDirectories ?? false;
+      initialFit = location.showIndexedDirectories !== void 0 || !indexedDirectoryCount();
     }
   } catch {
     mapLocations.clear();
@@ -200,7 +265,7 @@ function moduleTrail(id) {
   }
   return trail;
 }
-function navigateMap(parent, calls = "") {
+function navigateMap(parent, calls = "", redraw = true) {
   if (parent === mapParent && calls === callRoot) return;
   rememberMap();
   mapParent = parent;
@@ -215,16 +280,21 @@ function navigateMap(parent, calls = "") {
   view = saved ? { ...saved.view } : { x: 0, y: 0, scale: 1 };
   selectedModule = saved?.selectedModule || calls || parent;
   mapQuery = saved?.query || "";
+  showIndexedDirectories = saved?.showIndexedDirectories ?? false;
   selectedTask = "";
   journeyStep = -1;
   tab = "updates";
-  initialFit = Boolean(saved);
-  render();
-  requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+  initialFit = Boolean(saved && (saved.showIndexedDirectories !== void 0 || !indexedDirectoryCount()));
+  if (redraw) {
+    render();
+    requestAnimationFrame(() => document.getElementById("map-breadcrumbs")?.focus());
+  }
 }
-function renderMapNavigation() {
+function renderMapNavigation(moduleCount) {
   const trail = moduleTrail(mapParent);
-  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "\u67B6\u6784\u5C42\u7EA7")}">${mapParent || callRoot ? `<button id="map-up">\u2190 ${text("Back", "\u8FD4\u56DE\u4E0A\u5C42")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "\u4E3B\u67B6\u6784")}</button>` : `<span aria-current="page">${text("Main architecture", "\u4E3B\u67B6\u6784")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain \xB7 2 hops \xB7 max 80", "\u8C03\u7528\u94FE \xB7 \u4E24\u8DF3 \xB7 \u6700\u591A 80 \u4E2A\u8282\u70B9")}</span></li>` : ""}</ol><span class="map-scope-count">${visibleMapModules().length} ${text("modules", "\u4E2A\u6A21\u5757")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" placeholder="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" value="${esc(mapQuery)}">` : ""}</nav>`;
+  const directoryCount = indexedDirectoryCount();
+  const directoryToggle = directoryCount ? `<button id="indexed-directories" aria-pressed="${showIndexedDirectories}">${text("Indexed directories", "\u7D22\u5F15\u76EE\u5F55")} \xB7 ${directoryCount}</button>` : "";
+  return `<nav id="map-breadcrumbs" class="map-breadcrumbs" tabindex="-1" aria-label="${text("Architecture levels", "\u67B6\u6784\u5C42\u7EA7")}">${mapParent || callRoot ? `<button id="map-up">\u2190 ${text("Back", "\u8FD4\u56DE\u4E0A\u5C42")}</button>` : ""}<ol><li>${mapParent ? `<button data-map-scope="">${text("Main architecture", "\u4E3B\u67B6\u6784")}</button>` : `<span aria-current="page">${text("Main architecture", "\u4E3B\u67B6\u6784")}</span>`}</li>${trail.map((m, i) => `<li><span aria-hidden="true">/</span>${i === trail.length - 1 && !callRoot ? `<span aria-current="page">${esc(m.name)}</span>` : `<button data-map-scope="${esc(m.id)}">${esc(m.name)}</button>`}</li>`).join("")}${callRoot ? `<li><span aria-hidden="true">/</span><span aria-current="page">${text("Call chain \xB7 2 hops \xB7 max 80", "\u8C03\u7528\u94FE \xB7 \u4E24\u8DF3 \xB7 \u6700\u591A 80 \u4E2A\u8282\u70B9")}</span></li>` : ""}</ol><span class="map-scope-count">${moduleCount} ${text("modules", "\u4E2A\u6A21\u5757")}</span>${mapParent ? `<input id="module-search" type="search" aria-label="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" placeholder="${text("Find a class or method", "\u67E5\u627E\u7C7B\u6216\u65B9\u6CD5")}" value="${esc(mapQuery)}">` : ""}${directoryToggle}</nav>`;
 }
 var formatDate = (v) => v ? new Date(v).toLocaleString(lang === "zh" ? "zh-CN" : "en-US", {
   month: "short",
@@ -333,7 +403,8 @@ function groupTitle(kind) {
     config: ["Configuration", "\u914D\u7F6E"],
     package: ["Packages", "\u8F6F\u4EF6\u5305"],
     application: ["Applications", "\u5E94\u7528"],
-    infrastructure: ["Infrastructure", "\u57FA\u7840\u8BBE\u65BD"]
+    infrastructure: ["Infrastructure", "\u57FA\u7840\u8BBE\u65BD"],
+    directory: ["Indexed directories", "\u7D22\u5F15\u76EE\u5F55"]
   };
   return titles[kind] ? text(...titles[kind]) : kind || text("Modules", "\u6A21\u5757");
 }
@@ -357,7 +428,7 @@ function groups() {
   const entries = [...map];
   const descriptions = new Map(data?.config.moduleGroups?.map((g) => [g.id, g.description]));
   const columns = mapParent ? Math.max(1, Math.min(entries.length, Math.round(Math.sqrt(entries.length * stageSize.width / stageSize.height)))) : Math.max(1, entries.length);
-  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns || (mapParent ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3)))) : 1));
+  const nodeColumns = entries.map(([id, modules]) => groupPositions.get(id)?.columns || (mapParent || showIndexedDirectories && id === "directory" ? Math.min(4, Math.max(1, Math.ceil(Math.sqrt(modules.length / 3)))) : 1));
   const hierarchies = entries.map(([, modules], i) => hierarchyFor(modules, nodeColumns[i]));
   const result = [];
   for (const [i, [id, modules]] of entries.entries()) {
@@ -385,7 +456,7 @@ function groups() {
       id,
       title: groupTitle(id),
       description: descriptions.get(id),
-      modules: hierarchies[i] ? hierarchies[i].families.flatMap((f) => f.members.map((id2) => modules.find((m) => m.id === id2))) : modules,
+      modules: hierarchies[i] ? hierarchies[i].families.flatMap((f) => f.members.map((id2) => moduleById(id2))) : modules,
       color: palettes[i % palettes.length],
       ...p,
       columns: nodeColumns[i],
@@ -396,21 +467,23 @@ function groups() {
   }
   return result;
 }
-function nodePos(m, g) {
+function nodePos(m, g, index) {
+  const saved = nodePositions.get(m.id);
+  if (saved) return saved;
   g = g || groups().find((gr) => gr.modules.some((n) => n.id === m.id));
-  const i = g?.modules.findIndex((n) => n.id === m.id) || 0;
+  const i = index ?? g?.modules.findIndex((n) => n.id === m.id) ?? 0;
   const planned = g?.hierarchy?.positions.get(m.id);
-  const position = nodePositions.get(m.id) || {
+  const position = {
     x: (g?.x || 0) + 25 + (planned?.x ?? i % (g?.columns || 1) * 350) + (m.x || 0),
     y: (g?.y || 0) + 115 + (g?.description ? 40 : 0) + (planned?.y ?? Math.floor(i / (g?.columns || 1)) * 164) + (m.y || 0)
   };
-  if (mapParent && !nodePositions.has(m.id)) {
+  if (mapParent) {
     while ([...nodePositions.values()].some((p) => p.x === position.x && p.y === position.y)) position.y += 164;
     nodePositions.set(m.id, position);
   }
   return position;
 }
-function activeModules() {
+function activeModules(gs) {
   if (selectedTask) {
     const task = data?.ledger.tasks.find((t) => t.id === selectedTask);
     return new Set(
@@ -425,7 +498,7 @@ function activeModules() {
       ) || []
     );
   }
-  const family = groups().flatMap((g) => g.hierarchy?.families || []).find((f) => f.members.includes(selectedModule));
+  const family = gs.flatMap((g) => g.hierarchy?.families || []).find((f) => f.members.includes(selectedModule));
   return new Set(family?.members || (selectedModule && selectedModule !== mapParent ? [selectedModule] : []));
 }
 function render() {
@@ -458,7 +531,7 @@ function render() {
   const s = snapshot(), r = data.runtime;
   document.documentElement.lang = lang === "zh" ? "zh-CN" : "en";
   document.title = `Tika's Code \xB7 ${workspaceTitle()}`;
-  app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "\u5F00\u53D1\u753B\u5E03")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "\u8BF4\u660E\u4E0E\u5BFC\u822A")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "\u8C03\u6574\u53F3\u4FA7\u5BBD\u5EA6")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "\u4EE3\u7801\u4E0E\u8FD0\u884C\u5730\u56FE")}</h1><select id="version-picker" aria-label="${text("View version", "\u67E5\u770B\u7248\u672C")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "\u5F53\u524D\u5DE5\u4F5C\u533A")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "\u8FDC\u7AEF\u5206\u652F")}${data.config.remote.branch ? " \xB7 " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "\u753B\u5E03\u89C6\u56FE")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "\u4EE3\u7801\u5730\u56FE")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "\u66F4\u65B0\u6E90\u7801\u7D22\u5F15")}" ${busy ? "disabled" : ""}>\u21BB</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "\u8BBE\u7F6E")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "\u5207\u6362\u5230\u82F1\u6587")}">${lang === "zh" ? "EN" : "\u4E2D\u6587"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</h2><p class="empty-text">${text("Tasks are grouped by dependency depth, not by status. Click a card for scope, ownership, commits and independent review evidence.", "\u4EFB\u52A1\u6309\u4F9D\u8D56\u5C42\u7EA7\u5206\u7EC4\uFF0C\u4E0D\u6309\u72B6\u6001\u5206\u5217\u3002\u70B9\u51FB\u5361\u7247\u67E5\u770B\u8303\u56F4\u3001\u8BA4\u9886\u3001\u63D0\u4EA4\u548C\u72EC\u7ACB\u9A8C\u6536\u8BC1\u636E\u3002")}</p><button class="primary" id="new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button>${renderTaskDetail(void 0)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "\u67B6\u6784\u8F85\u52A9\u5BFC\u822A")}">${["updates", "journeys", "folders"].map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "\u672C\u6B21\u66F4\u65B0"), text("Journeys", "\u64CD\u4F5C\u65C5\u7A0B"), text("Folders", "\u6587\u4EF6\u5939")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "\u989C\u8272\u3001\u8FDE\u7EBF\u548C\u9A8C\u8BC1\u8FB9\u754C")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "\u5927\u6A21\u5757\u5E95\u8272\u533A\u5206\u7C7B\u522B\u3002\u5B9E\u7EBF\u8868\u793A\u6709\u89C2\u5BDF\u6216\u6838\u5BF9\u4F9D\u636E\u7684\u6E90\u7801\u5173\u7CFB\uFF0C\u70B9\u7EBF\u8868\u793A\u63A8\u65AD\u3002\u6E90\u7801\u5206\u6790\u4E0D\u7B49\u4E8E\u8FD0\u884C\u9A8C\u6536\u3002")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "\u62D6\u52A8\u5361\u7247\u6216\u7EC4\u6807\u9898\uFF1B\u62D6\u52A8\u7A7A\u767D\u5E73\u79FB\uFF0C\u6EDA\u8F6E\u7F29\u653E\u3002\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "\u7248\u672C\u4E0E\u4F7F\u7528\u8BF4\u660E")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "\u5DE5\u4F5C\u533A")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "\u4ECA\u65E5 AI \u8C03\u7528")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "\u5206\u6790")}</button><button id="pause-button">${r.paused ? text("Resume", "\u6062\u590D") : text("Pause", "\u6682\u505C")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "\u540C\u6B65\u8FDC\u7AEF")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI \xB7 ${esc(short(s?.source.commit))}${s?.source.dirty ? " \xB7 " + text("modified", "\u6709\u4FEE\u6539") : ""}</span><button class="subtle" id="help-button">${text("Help", "\u4F7F\u7528\u5E2E\u52A9")}</button></div><span class="attribution">SienGe AI Lab \xB7 \u5C0F\u7EA2\u4E66\uFF1ASienGe\u7684AI\u5B9E\u9A8C\u5BA4</span></footer></aside></main>`;
+  app.innerHTML = `<main class="workspace" style="--side-width:${sideWidth}px"><section class="canvas-shell" aria-label="${text("Development canvas", "\u5F00\u53D1\u753B\u5E03")}">${viewMode === "map" ? renderMap() : renderParallel()}</section><aside class="sidebar" aria-label="${text("Details and navigation", "\u8BF4\u660E\u4E0E\u5BFC\u822A")}"><div id="resize-handle" class="resize-handle" role="separator" aria-orientation="vertical" aria-label="${text("Resize sidebar", "\u8C03\u6574\u53F3\u4FA7\u5BBD\u5EA6")}" aria-valuemin="320" aria-valuemax="720" aria-valuenow="${sideWidth}" tabindex="0"></div><header class="side-header"><h1 title="${esc(workspaceTitle())}">${text("Code & runtime map", "\u4EE3\u7801\u4E0E\u8FD0\u884C\u5730\u56FE")}</h1><select id="version-picker" aria-label="${text("View version", "\u67E5\u770B\u7248\u672C")}"><option value="local" ${source === "local" ? "selected" : ""}>${text("Current workspace", "\u5F53\u524D\u5DE5\u4F5C\u533A")}</option><option value="remote" ${source === "remote" ? "selected" : ""} ${!data.config.remote.enabled ? "disabled" : ""}>${text("Remote branch", "\u8FDC\u7AEF\u5206\u652F")}${data.config.remote.branch ? " \xB7 " + esc(data.config.remote.branch) : ""}</option></select></header><div class="parallel-view-switch" role="group" aria-label="${text("Canvas view", "\u753B\u5E03\u89C6\u56FE")}"><button id="dev-board-open" aria-pressed="${viewMode === "parallel"}">${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</button><button id="dev-map-open" aria-pressed="${viewMode === "map"}">${text("Code map", "\u4EE3\u7801\u5730\u56FE")}</button></div><div class="sidebar-tools"><span class="tool-status ${error || r.error ? "error" : ""}" title="${esc(runtimeLabel())}">${esc(runtimeLabel())}</span><button id="refresh-button" title="${text("Update source index", "\u66F4\u65B0\u6E90\u7801\u7D22\u5F15")}" ${busy ? "disabled" : ""}>\u21BB</button><button id="role-button">A/B/C</button><button id="settings-button">${text("Settings", "\u8BBE\u7F6E")}</button><button id="language-button" aria-label="${text("Switch to Chinese", "\u5207\u6362\u5230\u82F1\u6587")}">${lang === "zh" ? "EN" : "\u4E2D\u6587"}</button></div>${viewMode === "parallel" ? `<section class="parallel-inspector" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : `<h2>${text("Parallel development", "\u5E76\u884C\u5F00\u53D1")}</h2><p class="empty-text">${text("Click a card for scope, ownership, commits and independent review evidence.", "\u70B9\u51FB\u5361\u7247\u67E5\u770B\u8303\u56F4\u3001\u8BA4\u9886\u3001\u63D0\u4EA4\u548C\u72EC\u7ACB\u9A8C\u6536\u8BC1\u636E\u3002")}</p><button class="primary" id="new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button>${renderTaskDetail(void 0)}`}</section>` : `<nav class="tabs" role="tablist" aria-label="${text("Architecture navigation", "\u67B6\u6784\u8F85\u52A9\u5BFC\u822A")}">${["updates", "journeys", "folders"].map((k, i) => `<button id="tab-${k}" role="tab" aria-selected="${tab === k}" tabindex="${tab === k ? 0 : -1}" data-tab="${k}">${[text("Updates", "\u672C\u6B21\u66F4\u65B0"), text("Journeys", "\u64CD\u4F5C\u65C5\u7A0B"), text("Folders", "\u6587\u4EF6\u5939")][i]}</button>`).join("")}</nav>${tab === "journeys" ? renderJourneyNav() : ""}<div class="sidebar-scroll">${renderNotice()}<section id="panel-${tab}" role="tabpanel" aria-labelledby="tab-${tab}">${tab === "updates" ? renderUpdates() : tab === "journeys" ? renderJourneys() : renderFiles()}</section>${tab !== "folders" ? `<section id="selection" class="selection" aria-live="polite">${selectedTask ? renderTaskDetail(data.ledger.tasks.find((t) => t.id === selectedTask)) : selectedModule ? renderModuleDetail(moduleById(selectedModule)) : renderSelectionEmpty()}</section>` : ""}<details class="legend"><summary>${text("Colors, connections & evidence", "\u989C\u8272\u3001\u8FDE\u7EBF\u548C\u9A8C\u8BC1\u8FB9\u754C")}</summary><p class="fine">${text("Group colors show module categories. Solid connections have observed or verified source evidence; dotted ones are inferred. Source analysis is not runtime acceptance.", "\u5927\u6A21\u5757\u5E95\u8272\u533A\u5206\u7C7B\u522B\u3002\u5B9E\u7EBF\u8868\u793A\u6709\u89C2\u5BDF\u6216\u6838\u5BF9\u4F9D\u636E\u7684\u6E90\u7801\u5173\u7CFB\uFF0C\u70B9\u7EBF\u8868\u793A\u63A8\u65AD\u3002\u6E90\u7801\u5206\u6790\u4E0D\u7B49\u4E8E\u8FD0\u884C\u9A8C\u6536\u3002")}</p><p class="fine">${text("Drag cards or group titles. Drag blank space to pan; scroll to zoom. Arrow keys move, +/- zoom, 0 fits the map.", "\u62D6\u52A8\u5361\u7247\u6216\u7EC4\u6807\u9898\uFF1B\u62D6\u52A8\u7A7A\u767D\u5E73\u79FB\uFF0C\u6EDA\u8F6E\u7F29\u653E\u3002\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}</p></details><details class="learning-section"><summary>${text("Version & usage notes", "\u7248\u672C\u4E0E\u4F7F\u7528\u8BF4\u660E")}</summary>${renderVersion()}<p class="fine">${text("Workspace", "\u5DE5\u4F5C\u533A")}: ${esc(workspaceTitle())}<br>${text("AI calls today", "\u4ECA\u65E5 AI \u8C03\u7528")}: ${r.analysisCalls}/${data.config.analysis.maxCallsPerDay}</p><div class="role-buttons"><button id="analysis-button">${text("Analyze", "\u5206\u6790")}</button><button id="pause-button">${r.paused ? text("Resume", "\u6062\u590D") : text("Pause", "\u6682\u505C")}</button>${data.config.remote.enabled ? `<button id="sync-button">${text("Sync remote", "\u540C\u6B65\u8FDC\u7AEF")}</button>` : ""}</div></details></div>`}<footer class="sidebar-footer"><div class="footer-first"><span>Nativue AI \xB7 ${esc(short(s?.source.commit))}${s?.source.dirty ? " \xB7 " + text("modified", "\u6709\u4FEE\u6539") : ""}</span><button class="subtle" id="help-button">${text("Help", "\u4F7F\u7528\u5E2E\u52A9")}</button></div><span class="attribution">\u4E14\u5171\u4ECE\u5BB9</span></footer></aside></main>`;
   bind();
   bindResize();
   bindCanvas(viewMode === "parallel");
@@ -519,12 +592,23 @@ function renderJavaStatus() {
   const c = j.changes;
   return `<details class="java-report" ${j.status === "failed" ? "open" : ""}><summary>${text("Java automatic source graph", "Java \u6E90\u7801\u81EA\u52A8\u5EFA\u56FE")} \xB7 ${j.status === "failed" ? text("Failed \xB7 previous graph retained", "\u5931\u8D25 \xB7 \u4FDD\u7559\u4E0A\u4E00\u6709\u6548\u56FE") : text("Updated", "\u5DF2\u66F4\u65B0")}</summary><p>${text("Parsed / cached / re-resolved files", "\u89E3\u6790 / \u7F13\u5B58\u590D\u7528 / \u5173\u7CFB\u91CD\u7B97\u6587\u4EF6")}: ${j.parsedFiles} / ${j.reusedFiles} / ${j.resolvedFiles}</p><p>${text("Added / changed / removed nodes", "\u65B0\u589E / \u53D8\u5316 / \u5220\u9664\u8282\u70B9")}: ${c.added.length} / ${c.changed.length} / ${c.removed.length}<br>${text("Added / changed / removed relationships", "\u65B0\u589E / \u53D8\u5316 / \u5220\u9664\u5173\u7CFB")}: ${c.addedEdges.length} / ${c.changedEdges.length} / ${c.removedEdges.length}</p>${c.removed.slice(0, 20).map((m) => `<p class="removed-item">\u2212 ${esc(m.name)}</p>`).join("")}${c.removedEdges.slice(0, 20).map((e) => `<p class="removed-item">\u2212 ${esc(e.relation)}: ${esc(e.label)}</p>`).join("")}<p>${text("Unresolved / ambiguous / parser diagnostics", "\u672A\u89E3\u6790 / \u6B67\u4E49 / \u8BED\u6CD5\u8BCA\u65AD")}: ${j.diagnosticCount}</p><div class="java-diagnostics">${j.diagnostics.slice(0, 25).map((d) => `<p><code>${esc(d.path)}:${d.line}</code><br>${esc(d.kind)} \xB7 ${esc(d.message)}</p>`).join("")}</div><p>${text("Feature membership is inferred. Relationships describe declared source targets; reflection, complex call chains and runtime binding remain unresolved.", "\u529F\u80FD\u5F52\u5C5E\u662F\u63A8\u65AD\u3002\u8FDE\u7EBF\u8868\u793A\u6E90\u7801\u58F0\u660E\u76EE\u6807\uFF1B\u53CD\u5C04\u3001\u590D\u6742\u94FE\u5F0F\u8868\u8FBE\u5F0F\u548C\u8FD0\u884C\u65F6\u7ED1\u5B9A\u4ECD\u6709\u89E3\u6790\u8FB9\u754C\u3002")}</p></details>`;
 }
-function mapEdges() {
-  const visible = new Set(visibleMapModules().map((m) => m.id));
-  const lift = (id) => callRoot ? visible.has(id) ? id : void 0 : moduleTrail(id).find((m) => (m.parentId || "") === mapParent)?.id;
+var edgeProjections = /* @__PURE__ */ new WeakMap();
+function mapEdges(visible) {
+  const s = snapshot();
+  if (!s) return [];
+  const cached = edgeProjections.get(s);
+  if (!callRoot && cached?.parent === mapParent && cached.language === lang) return cached.edges;
+  const lifted = /* @__PURE__ */ new Map();
+  const lift = (id) => {
+    if (callRoot) return visible.has(id) ? id : void 0;
+    if (!lifted.has(id)) {
+      lifted.set(id, moduleTrail(id).find((m) => (m.parentId || "") === mapParent)?.id);
+    }
+    return lifted.get(id);
+  };
   const projected = /* @__PURE__ */ new Map();
   const result = [];
-  for (const e of snapshot()?.edges || []) {
+  for (const e of s.edges) {
     if (e.generator !== "java") {
       if (!callRoot) result.push(e);
       continue;
@@ -541,7 +625,9 @@ function mapEdges() {
       if (e.change) existing.edge.change = e.change;
     } else projected.set(key, { edge: { ...e, from, to }, count: 1 });
   }
-  return [...result, ...[...projected.values()].map(({ edge, count }) => ({ ...edge, label: edge.label + (count > 1 ? ` \xB7 ${count} ${text("source relationships", "\u6761\u6E90\u7801\u5173\u7CFB")}` : "") }))];
+  const edges = [...result, ...[...projected.values()].map(({ edge, count }) => ({ ...edge, label: edge.label + (count > 1 ? ` \xB7 ${count} ${text("source relationships", "\u6761\u6E90\u7801\u5173\u7CFB")}` : "") }))];
+  if (!callRoot) edgeProjections.set(s, { parent: mapParent, language: lang, edges });
+  return edges;
 }
 function typeName(m) {
   const names = { class: ["Class", "\u7C7B"], interface: ["Interface", "\u63A5\u53E3"], enum: ["Enum", "\u679A\u4E3E"], record: ["Record", "\u8BB0\u5F55\u7C7B"] };
@@ -551,7 +637,7 @@ function typeRelations(m) {
   const relations = [];
   const owner = moduleById(m.declaringTypeId || "");
   if (owner) relations.push({ target: owner, label: text("Declared in", "\u5185\u90E8\u7C7B\u578B\uFF0C\u5C5E\u4E8E") });
-  for (const edge of snapshot()?.edges || []) {
+  for (const edge of graphIndex()?.incidentEdges.get(m.id) || []) {
     if (edge.from !== m.id || !["implements", "extends"].includes(edge.relation || "")) continue;
     const target = moduleById(edge.to);
     if (target) relations.push({ target, label: edge.relation === "implements" ? text("Implements", "\u5B9E\u73B0") : text("Extends", "\u7EE7\u627F") });
@@ -577,13 +663,14 @@ function typeLinkPath(from, to) {
   return `M ${from.x} ${from.y + 77} H ${rail} V ${to.y + 77} H ${to.x - 4}`;
 }
 function renderMap() {
-  const s = snapshot(), gs = groups(), active = activeModules();
-  const visibleIds = new Set(gs.flatMap((g) => g.modules.map((m) => m.id)));
-  const visible = (m) => visibleIds.has(m.id) && !collapsed.has(m.kind || "source");
+  const s = snapshot(), gs = groups(), active = activeModules(gs);
+  const positions = /* @__PURE__ */ new Map();
   const nodes = gs.map(
     (g, i) => `<section class="group ${collapsed.has(g.id) ? "collapsed" : ""}" data-group-box="${esc(g.id)}" style="left:${g.x}px;top:${g.y}px;width:${g.width}px;height:${g.height}px;--group-bg:${g.color[0]};--group-head:${g.color[1]};--group-line:${g.color[2]}" aria-label="${esc(g.title)}"><div class="group-header"><button class="group-head" data-drag-group="${esc(g.id)}" title="${text("Drag to move group; Alt + arrow keys", "\u62D6\u52A8\u79FB\u52A8\u6574\u7EC4\uFF1BAlt + \u65B9\u5411\u952E\u4E5F\u53EF\u79FB\u52A8")}"><span class="group-no">${String(i + 1).padStart(2, "0")}</span><span class="group-name">${esc(g.title)}</span><span aria-hidden="true">\u283F</span></button><button class="group-toggle" data-group="${esc(g.id)}" aria-label="${text("Expand or collapse", "\u5C55\u5F00\u6216\u6536\u8D77")} ${esc(g.title)}" aria-expanded="${!collapsed.has(g.id)}">${collapsed.has(g.id) ? "\uFF0B" : "\u2212"}</button></div><p class="group-subtitle">${g.modules.length} ${text("modules", "\u4E2A\u6A21\u5757")} \xB7 ${g.modules.reduce((n, m) => n + m.files.length, 0)} ${text("source files", "\u4E2A\u6E90\u6587\u4EF6")}${collapsed.has(g.id) ? " \xB7 " + text("collapsed", "\u5DF2\u6536\u8D77") : ""}</p>${g.description ? `<p class="group-description" title="${esc(g.description)}">${esc(g.description)}</p>` : ""}${!collapsed.has(g.id) ? renderTypeFamilies(g) + g.modules.map((m, j) => {
-      const p = nodePos(m, g);
-      return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? active.has(m.id) ? "highlighted" : "dim" : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childModules(m.id).length ? text("Click for details; double-click to open internal architecture; drag to move", "\u5355\u51FB\u67E5\u770B\u4FE1\u606F\uFF1B\u53CC\u51FB\u8FDB\u5165\u5185\u90E8\u67B6\u6784\uFF1B\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E") : text("Drag to move; click for details", "\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E\uFF1B\u70B9\u51FB\u67E5\u770B\u89E3\u91CA")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} \u283F${childModules(m.id).length ? ` \xB7 \u21B3 ${childModules(m.id).length} ${text("submodules", "\u5B50\u6A21\u5757")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "\u65B0\u589E") : text("Changed", "\u53D8\u5316")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "\u7B49\u5F85\u8BF4\u660E"))}</span></button>`;
+      const p = nodePos(m, g, j);
+      positions.set(m.id, p);
+      const childCount = childModules(m.id).length;
+      return `<button class="node ${g.hierarchy ? "type-node" : ""} status-${m.confidence === "verified" ? "passed" : m.confidence === "inferred" ? "reference" : "connected"} ${selectedModule === m.id ? "selected" : ""} ${active.size ? active.has(m.id) ? "highlighted" : "dim" : ""}" data-node="${esc(m.id)}" data-change="${m.change || ""}" aria-pressed="${selectedModule === m.id}" title="${childCount ? text("Click for details; double-click to open internal architecture; drag to move", "\u5355\u51FB\u67E5\u770B\u4FE1\u606F\uFF1B\u53CC\u51FB\u8FDB\u5165\u5185\u90E8\u67B6\u6784\uFF1B\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E") : text("Drag to move; click for details", "\u62D6\u52A8\u8C03\u6574\u4F4D\u7F6E\uFF1B\u70B9\u51FB\u67E5\u770B\u89E3\u91CA")}" style="left:${p.x - g.x}px;top:${p.y - g.y}px"><span class="node-top"><span class="node-id">${String(i + 1).padStart(2, "0")}.${j + 1} \u283F${childCount ? ` \xB7 \u21B3 ${childCount} ${text("submodules", "\u5B50\u6A21\u5757")}` : ""}</span><span class="status-tag">${esc(confidence(m.confidence))}</span></span><span class="node-title">${m.change ? `<small class="change-badge">${m.change === "added" ? text("Added", "\u65B0\u589E") : text("Changed", "\u53D8\u5316")}</small>` : ""}${esc(m.name)}</span>${renderTypeBadge(m)}<span class="node-caption">${esc(m.description || text("Awaiting explanation", "\u7B49\u5F85\u8BF4\u660E"))}</span></button>`;
     }).join("") : ""}</section>`
   ).join("");
   const rects = gs.map((g) => ({
@@ -593,19 +680,20 @@ function renderMap() {
     height: g.height
   }));
   const bounds = boundsOf(rects, 180);
-  const edges = mapEdges().map((e, i) => {
+  const edges = mapEdges(new Set(callRoot ? gs.flatMap((g) => g.modules.map((m) => m.id)) : [])).map((e, i) => {
+    const ar = positions.get(e.from), br = positions.get(e.to);
+    if (!ar || !br) return "";
     const a = moduleById(e.from), b = moduleById(e.to);
-    if (!a || !b || !visible(a) || !visible(b)) return "";
-    const ar = nodePos(a), br = nodePos(b);
     const focus = active.size > 0 && active.has(e.from) && active.has(e.to) || selectedModule && (e.from === selectedModule || e.to === selectedModule);
     return `<path data-from="${esc(e.from)}" data-to="${esc(e.to)}" data-route="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? "type" : "edge"}" data-route-index="${i}" data-change="${e.change || ""}" class="edge ${e.confidence === "inferred" ? "reference" : ""} ${focus ? "active" : active.size ? "dim" : ""}" d="${["implements", "extends"].includes(e.relation || "") && a.level === "class" && b.level === "class" ? typeLinkPath(ar, br) : edgePath(ar, br, i)}"><title>${esc(e.label)} \xB7 ${esc(confidence(e.confidence))}${e.evidence[0] ? " \xB7 " + esc(e.evidence[0].path) + (e.evidence[0].line ? ":" + e.evidence[0].line : "") : ""}</title></path>`;
   }).join("") || "";
   const containment = gs.flatMap((g) => g.modules).map((m) => {
     const owner = moduleById(m.declaringTypeId || "");
-    if (!owner || !visible(m) || !visible(owner)) return "";
-    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(nodePos(owner), nodePos(m))}"><title>${esc(owner.name)} \xB7 ${text("contains", "\u5305\u542B\u5185\u90E8\u7C7B\u578B")} ${esc(m.name)}</title></path>`;
+    const memberPosition = positions.get(m.id), ownerPosition = positions.get(owner?.id || "");
+    if (!owner || !memberPosition || !ownerPosition) return "";
+    return `<path class="containment ${active.size && (!active.has(m.id) || !active.has(owner.id)) ? "dim" : ""}" data-owner="${esc(owner.id)}" data-member="${esc(m.id)}" d="${typeLinkPath(ownerPosition, memberPosition)}"><title>${esc(owner.name)} \xB7 ${text("contains", "\u5305\u542B\u5185\u90E8\u7C7B\u578B")} ${esc(m.name)}</title></path>`;
   }).join("");
-  return `${renderMapNavigation()}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "\u67B6\u6784\u753B\u5E03\u3002\u62D6\u52A8\u7A7A\u767D\u79FB\u52A8\uFF0C\u6EDA\u8F6E\u7F29\u653E\uFF1B\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "\u8FDC\u7AEF\u4EE3\u7801\u5730\u56FE") : text("Start with your code", "\u4ECE\u4F60\u7684\u4EE3\u7801\u5F00\u59CB")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "\u5F00\u542F\u5E76\u540C\u6B65\u8FDC\u7AEF\u540E\uFF0C\u5373\u53EF\u67E5\u770B\u72EC\u7ACB\u5FEB\u7167\u3002") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "\u8BF7\u8BA9 Agent \u4F7F\u7528 Nativue Skill\uFF0C\u4ECE\u5DF2\u7D22\u5F15\u4EE3\u7801\u5206\u6790\u6A21\u5757\u3001\u6E90\u7801\u8BC1\u636E\u548C\u64CD\u4F5C\u65C5\u7A0B\u3002")}</p><button id="empty-role">${text("Get Agent instructions", "\u83B7\u53D6 Agent \u6307\u4EE4")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "\u8FDE\u7EBF\u56FE\u4F8B")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "\u6E90\u7801\u5173\u7CFB")}</div><div><span class="line-sample reference"></span>${text("Inferred \xB7 needs verification", "\u63A8\u65AD \xB7 \u5F85\u6838\u5B9E")}</div>${gs.some((g) => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "\u65E0\u7BAD\u5934\u62EC\u7EBF\uFF1A\u5185\u90E8\u7C7B\u578B\u5F52\u5C5E")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "\u7BAD\u5934\u6307\u5411\u63A5\u6536\u65B9\uFF0C\u6DF1\u8272\u8868\u793A\u5F53\u524D\u9AD8\u4EAE\u3002")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "\u753B\u5E03\u89C6\u91CE")}"><button id="zoom-out" aria-label="${text("Zoom out", "\u7F29\u5C0F")}">\u2212</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "\u653E\u5927")}">\uFF0B</button><span class="divider"></span><button id="fit">${text("Fit all", "\u5168\u56FE")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "\u5B9A\u4F4D\u6240\u9009")}</button><button id="clear">${text("Clear", "\u6E05\u9664\u9AD8\u4EAE")}</button>${gs.some((g) => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "\u6309\u6E90\u7801\u5173\u7CFB\u91CD\u65B0\u6392\u5217\u5F53\u524D\u529F\u80FD\u4E0B\u7684\u7C7B\u578B")}">${text("Arrange code hierarchy", "\u6309\u4EE3\u7801\u5C42\u7EA7\u6392\u5217")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "\u91CD\u7F6E\u5E03\u5C40")}</button></div></div>`;
+  return `${renderMapNavigation(gs.reduce((count, group) => count + group.modules.length, 0))}<div id="viewport" class="viewport" tabindex="0" aria-label="${text("Architecture canvas. Drag to pan, scroll to zoom. Arrow keys move, +/- zoom, 0 fits.", "\u67B6\u6784\u753B\u5E03\u3002\u62D6\u52A8\u7A7A\u767D\u79FB\u52A8\uFF0C\u6EDA\u8F6E\u7F29\u653E\uFF1B\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u56DE\u5230\u5168\u56FE\u3002")}"><div id="world" class="world" style="transform:translate(${view.x}px,${view.y}px) scale(${view.scale})"><svg class="connections" style="left:${bounds.x}px;top:${bounds.y}px" width="${bounds.width}" height="${bounds.height}" viewBox="${bounds.x} ${bounds.y} ${bounds.width} ${bounds.height}" aria-hidden="true"><defs><marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0 0 L10 5 L0 10 z" fill="context-stroke"/></marker></defs>${edges}${containment}</svg><div id="groups">${nodes}</div></div>${!s?.modules.length ? `<div class="map-empty"><h2>${source === "remote" ? text("Remote code map", "\u8FDC\u7AEF\u4EE3\u7801\u5730\u56FE") : text("Start with your code", "\u4ECE\u4F60\u7684\u4EE3\u7801\u5F00\u59CB")}</h2><p>${source === "remote" ? text("Enable and sync your remote to view a separate snapshot.", "\u5F00\u542F\u5E76\u540C\u6B65\u8FDC\u7AEF\u540E\uFF0C\u5373\u53EF\u67E5\u770B\u72EC\u7ACB\u5FEB\u7167\u3002") : text("Ask your Agent to use the Nativue Skill to map modules, evidence and journeys from your indexed code.", "\u8BF7\u8BA9 Agent \u4F7F\u7528 Nativue Skill\uFF0C\u4ECE\u5DF2\u7D22\u5F15\u4EE3\u7801\u5206\u6790\u6A21\u5757\u3001\u6E90\u7801\u8BC1\u636E\u548C\u64CD\u4F5C\u65C5\u7A0B\u3002")}</p><button id="empty-role">${text("Get Agent instructions", "\u83B7\u53D6 Agent \u6307\u4EE4")}</button></div>` : ""}</div><details class="line-legend"><summary>${text("Connection legend", "\u8FDE\u7EBF\u56FE\u4F8B")}</summary><div><span class="line-sample call"></span>${text("Source relationship", "\u6E90\u7801\u5173\u7CFB")}</div><div><span class="line-sample reference"></span>${text("Inferred \xB7 needs verification", "\u63A8\u65AD \xB7 \u5F85\u6838\u5B9E")}</div>${gs.some((g) => g.hierarchy) ? `<div>${text("Brackets without arrows: nested type ownership", "\u65E0\u7BAD\u5934\u62EC\u7EBF\uFF1A\u5185\u90E8\u7C7B\u578B\u5F52\u5C5E")}</div>` : ""}<p>${text("Arrows point to the receiving module. Dark lines indicate the current selection.", "\u7BAD\u5934\u6307\u5411\u63A5\u6536\u65B9\uFF0C\u6DF1\u8272\u8868\u793A\u5F53\u524D\u9AD8\u4EAE\u3002")}</p></details><div class="canvas-bottom"><div class="zoom-controls" role="group" aria-label="${text("Canvas viewport", "\u753B\u5E03\u89C6\u91CE")}"><button id="zoom-out" aria-label="${text("Zoom out", "\u7F29\u5C0F")}">\u2212</button><output id="zoom">${Math.round(view.scale * 100)}%</output><button id="zoom-in" aria-label="${text("Zoom in", "\u653E\u5927")}">\uFF0B</button><span class="divider"></span><button id="fit">${text("Fit all", "\u5168\u56FE")}</button><button id="focus" ${!selectedModule ? "disabled" : ""}>${text("Focus", "\u5B9A\u4F4D\u6240\u9009")}</button><button id="clear">${text("Clear", "\u6E05\u9664\u9AD8\u4EAE")}</button>${gs.some((g) => g.hierarchy) ? `<button id="arrange-code" title="${text("Rearrange the current feature by declared code relationships", "\u6309\u6E90\u7801\u5173\u7CFB\u91CD\u65B0\u6392\u5217\u5F53\u524D\u529F\u80FD\u4E0B\u7684\u7C7B\u578B")}">${text("Arrange code hierarchy", "\u6309\u4EE3\u7801\u5C42\u7EA7\u6392\u5217")}</button>` : ""}<button id="reset-layout">${text("Reset layout", "\u91CD\u7F6E\u5E03\u5C40")}</button></div></div>`;
 }
 function boundsOf(rects, padding = 0) {
   if (!rects.length) return { x: 0, y: 0, width: 1e3, height: 700 };
@@ -627,14 +715,16 @@ function edgePath(a, b, i) {
   return `M${ax} ${ay} C${ax} ${ay + sign * curve},${bx} ${by - sign * curve},${bx} ${by}`;
 }
 function taskStage(t) {
-  return t.status === "done" ? "passed" : t.status === "rework" ? "rework" : [
+  const status = t.progress ?? t.status;
+  return status === "done" ? "passed" : status === "rework" ? "rework" : [
     "review",
     "passed",
     "integrated",
     "integration-review",
     "integration-passed",
-    "handtest"
-  ].includes(t.status) ? "testing" : t.status === "developing" ? "confirmed" : "discussion";
+    "handtest",
+    "testing"
+  ].includes(status) ? "testing" : status === "developing" ? "confirmed" : "discussion";
 }
 function dependencyGroups() {
   const tasks = data.ledger.tasks, byId = new Map(tasks.map((t) => [t.id, t])), cache = /* @__PURE__ */ new Map();
@@ -657,29 +747,59 @@ function dependencyGroups() {
   return [...gs].sort(([a], [b]) => a < 0 ? 1 : b < 0 ? -1 : a - b);
 }
 function renderParallel() {
-  const gs = dependencyGroups();
-  return `<section id="parallel-board" class="parallel-board" aria-label="${text("Dependency-grouped parallel development canvas", "\u6309\u4F9D\u8D56\u5206\u7EC4\u7684\u5E76\u884C\u5F00\u53D1\u753B\u5E03")}"><header class="parallel-heading"><h1>${text("Parallel development plan", "\u5E76\u884C\u5F00\u53D1\u8BA1\u5212")}</h1><p>${data.ledger.tasks.length} ${text("tasks \xB7 grouped by dependency depth \xB7 select a card for ownership and evidence", "\u4E2A\u4EFB\u52A1 \xB7 \u6309\u4F9D\u8D56\u5C42\u7EA7\u5206\u7EC4 \xB7 \u70B9\u5361\u7247\u67E5\u770B\u8303\u56F4\u3001\u5206\u5DE5\u4E0E\u8BC1\u636E")}</p><div class="parallel-legend">${[
+  const byDepth = dependencyGroups();
+  const hasModules = data.ledger.tasks.some((t) => t.module);
+  const byModule = hasModules && parallelGrouping === "module";
+  const sortTasks = (a, b) => a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id);
+  const sections = byDepth.map(([depth, tasks]) => ({
+    key: String(depth),
+    title: depth < 0 ? text("Check dependencies", "\u5F85\u6838\u5BF9\u4F9D\u8D56") : text(`Group ${depth + 1}`, `\u7B2C ${depth + 1} \u7EC4`),
+    description: depth < 0 ? text("Missing task references or cyclic dependencies. Resolve before scheduling.", "\u4F9D\u8D56\u4EFB\u52A1\u7F3A\u5931\u6216\u5B58\u5728\u73AF\u8DEF\uFF0C\u8BF7\u5148\u6838\u5BF9\u518D\u6D3E\u5DE5\u3002") : depth === 0 ? text("No recorded prerequisites. File ownership still determines safe parallelism.", "\u65E0\u5DF2\u767B\u8BB0\u524D\u7F6E\u4EFB\u52A1\uFF0C\u4ECD\u9700\u6309\u6587\u4EF6\u8BA4\u9886\u5224\u65AD\u662F\u5426\u53EF\u5E76\u884C\u3002") : text("Contains prerequisites in earlier groups. Release each task against its actual dependency evidence.", "\u5305\u542B\u524D\u5E8F\u7EC4\u4F9D\u8D56\uFF0C\u987B\u6309\u6BCF\u9879\u5B9E\u9645\u4F9D\u8D56\u548C\u9A8C\u6536\u8BC1\u636E\u9010\u9879\u653E\u884C\u3002"),
+    invalid: depth < 0,
+    tasks: tasks.sort(sortTasks)
+  }));
+  const moduleTasks = /* @__PURE__ */ new Map();
+  const invalidSection = sections.find((section) => section.invalid);
+  if (byModule) {
+    const invalidIds = new Set(invalidSection?.tasks.map((task) => task.id));
+    for (const task of data.ledger.tasks) {
+      if (invalidIds.has(task.id)) continue;
+      const module = task.module?.trim() || "";
+      if (!moduleTasks.has(module)) moduleTasks.set(module, []);
+      moduleTasks.get(module).push(task);
+    }
+  }
+  const gs = byModule ? [
+    ...[...moduleTasks].map(([module, tasks]) => ({
+      key: `module:${module}`,
+      title: module || text("Other tasks", "\u5176\u4ED6\u4EFB\u52A1"),
+      description: "",
+      invalid: false,
+      tasks
+    })),
+    ...invalidSection ? [invalidSection] : []
+  ] : sections;
+  const grouping = hasModules ? `<label>${text("Group by", "\u5206\u7EC4")} <select id="parallel-grouping"><option value="module" ${byModule ? "selected" : ""}>${text("Module", "\u6A21\u5757")}</option><option value="dependency" ${byModule ? "" : "selected"}>${text("Dependencies", "\u4F9D\u8D56")}</option></select></label>` : "";
+  return `<section id="parallel-board" class="parallel-board" aria-label="${text("Parallel development canvas", "\u5E76\u884C\u5F00\u53D1\u753B\u5E03")}"><header class="parallel-heading"><h1>${text("Parallel development plan", "\u5E76\u884C\u5F00\u53D1\u8BA1\u5212")}</h1><p>${data.ledger.tasks.length} ${text("tasks \xB7 select a card for ownership and evidence", "\u4E2A\u4EFB\u52A1 \xB7 \u70B9\u5361\u7247\u67E5\u770B\u8303\u56F4\u3001\u5206\u5DE5\u4E0E\u8BC1\u636E")}</p>${grouping}<div class="parallel-legend">${[
     ["discussion", text("Ready", "\u5F85\u5F00\u53D1")],
     ["confirmed", text("Developing", "\u5F00\u53D1\u4E2D")],
-    ["testing", text("Review / integration / handtest", "\u9A8C\u6536 / \u96C6\u6210 / \u624B\u6D4B")],
-    ["passed", text("User accepted", "\u7528\u6237\u5DF2\u786E\u8BA4")],
+    ["testing", text("Testing / review / integration / handtest", "\u6D4B\u8BD5 / \u9A8C\u6536 / \u96C6\u6210 / \u624B\u6D4B")],
+    ["passed", text("Completed / user accepted", "\u5DF2\u5B8C\u6210 / \u7528\u6237\u5DF2\u786E\u8BA4")],
     ["rework", text("Rework required", "\u9700\u8FD4\u5DE5")]
   ].map(
     ([stage, title]) => `<span class="parallel-tag stage-${stage}">${title}</span>`
   ).join(
     ""
   )}</div></header><div id="parallel-viewport" class="parallel-viewport" tabindex="0" aria-label="${text("Task canvas: scroll to zoom, drag to pan, arrow keys to move, +/- zoom, 0 fits.", "\u4EFB\u52A1\u753B\u5E03\uFF1A\u6EDA\u8F6E\u7F29\u653E\uFF0C\u62D6\u52A8\u5E73\u79FB\uFF1B\u65B9\u5411\u952E\u79FB\u52A8\uFF0C\u52A0\u51CF\u952E\u7F29\u653E\uFF0C0 \u663E\u793A\u5168\u90E8\u4EFB\u52A1\u3002")}"><div id="parallel-groups" class="parallel-groups" style="transform:translate(${boardView.x}px,${boardView.y}px) scale(${boardView.scale})">${gs.map(
-    ([depth, tasks]) => `<section class="parallel-group" data-parallel-group="${depth}" aria-label="${text("Dependency group", "\u4F9D\u8D56\u7EC4")} ${depth + 1}"><header><h2>${depth < 0 ? text("Check dependencies", "\u5F85\u6838\u5BF9\u4F9D\u8D56") : text(`Group ${depth + 1}`, `\u7B2C ${depth + 1} \u7EC4`)}</h2><p>${depth < 0 ? text("Missing task references or cyclic dependencies. Resolve before scheduling.", "\u4F9D\u8D56\u4EFB\u52A1\u7F3A\u5931\u6216\u5B58\u5728\u73AF\u8DEF\uFF0C\u8BF7\u5148\u6838\u5BF9\u518D\u6D3E\u5DE5\u3002") : depth === 0 ? text("No recorded prerequisites. File ownership still determines safe parallelism.", "\u65E0\u5DF2\u767B\u8BB0\u524D\u7F6E\u4EFB\u52A1\uFF0C\u4ECD\u9700\u6309\u6587\u4EF6\u8BA4\u9886\u5224\u65AD\u662F\u5426\u53EF\u5E76\u884C\u3002") : text("Contains prerequisites in earlier groups. Release each task against its actual dependency evidence.", "\u5305\u542B\u524D\u5E8F\u7EC4\u4F9D\u8D56\uFF0C\u987B\u6309\u6BCF\u9879\u5B9E\u9645\u4F9D\u8D56\u548C\u9A8C\u6536\u8BC1\u636E\u9010\u9879\u653E\u884C\u3002")}</p></header><div class="parallel-cards">${tasks.sort(
-      (a, b) => a.priority.localeCompare(b.priority) || a.id.localeCompare(b.id)
-    ).map(
-      (t) => `<button class="parallel-card stage-${taskStage(t)}" data-parallel-card="${esc(t.id)}" data-cycle="${depth < 0}" aria-pressed="${selectedTask === t.id}"><span class="parallel-card-top"><b>${esc(t.id)}</b><span class="parallel-effort">${t.priority}</span></span><strong>${esc(t.title)}</strong><span class="parallel-tag stage-${taskStage(t)}">${esc(statusLabel(t.status))}</span><span class="parallel-owners"><span>${text("Development", "\u5F00\u53D1")} ${esc(t.developer || t.owner || text("Unassigned", "\u672A\u767B\u8BB0"))}</span><span>${text("Review", "\u9A8C\u6536")} ${esc(t.reviewer || text("Unassigned", "\u672A\u767B\u8BB0"))}</span></span>${t.description ? `<span class="parallel-note">${esc(t.description.length > 160 ? t.description.slice(0, 159) + "\u2026" : t.description)}</span>` : ""}${t.blocked ? `<span class="parallel-special">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</span>` : ""}<span class="parallel-deps">${text("Prerequisites", "\u63A5\u5165\u524D\u7F6E")}: ${esc(t.dependsOn.join(" / ") || text("None", "\u65E0"))}</span>${t.commit ? `<span class="parallel-deps">${text("Commit", "\u63D0\u4EA4")}: ${esc(short(t.commit))}</span>` : ""}</button>`
+    ({ key, title, description, invalid, tasks }) => `<section class="parallel-group" data-parallel-group="${esc(key)}" aria-label="${esc(title)}"><header><h2>${esc(title)}</h2>${description ? `<p>${esc(description)}</p>` : ""}</header><div class="parallel-cards">${tasks.map(
+      (t) => `<button class="parallel-card stage-${taskStage(t)}" data-parallel-card="${esc(t.id)}" data-cycle="${invalid}" aria-pressed="${selectedTask === t.id}"><span class="parallel-card-top"><b>${esc(t.id)}</b><span class="parallel-effort">${t.priority}</span></span><strong>${esc(t.title)}</strong><span class="parallel-tag stage-${taskStage(t)}">${esc(taskStatusLabel(t))}</span><span class="parallel-owners"><span>${text("Development", "\u5F00\u53D1")} ${esc(t.developer || t.owner || text("Unassigned", "\u672A\u767B\u8BB0"))}</span><span>${text("Review", "\u9A8C\u6536")} ${esc(t.reviewer || text("Unassigned", "\u672A\u767B\u8BB0"))}</span></span>${t.description ? `<span class="parallel-note">${esc(t.description.length > 160 ? t.description.slice(0, 159) + "\u2026" : t.description)}</span>` : ""}${t.blocked ? `<span class="parallel-special">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</span>` : ""}<span class="parallel-deps">${text("Prerequisites", "\u63A5\u5165\u524D\u7F6E")}: ${esc(t.dependsOn.join(" / ") || text("None", "\u65E0"))}</span>${t.commit ? `<span class="parallel-deps">${text("Commit", "\u63D0\u4EA4")}: ${esc(short(t.commit))}</span>` : ""}</button>`
     ).join("")}</div></section>`
   ).join(
     ""
   )}</div>${!gs.length ? `<div class="map-empty"><h2>${text("Your next task starts here.", "\u4ECE\u4E0B\u4E00\u4E2A\u4EFB\u52A1\u5F00\u59CB\u3002")}</h2><p>${text("Create a task or ask A to break down an Issue. Groups appear from actual dependencies.", "\u65B0\u5EFA\u4EFB\u52A1\uFF0C\u6216\u8BA9 A \u62C6\u5206 Issue\u3002\u4EFB\u52A1\u4F1A\u6309\u5B9E\u9645\u4F9D\u8D56\u5173\u7CFB\u5206\u7EC4\u3002")}</p><button id="board-new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button></div>` : ""}</div><footer class="parallel-toolbar"><div class="zoom-controls"><button id="parallel-zoom-out" aria-label="${text("Zoom out tasks", "\u7F29\u5C0F\u4EFB\u52A1\u753B\u5E03")}">\u2212</button><output id="parallel-zoom">${Math.round(boardView.scale * 100)}%</output><button id="parallel-zoom-in" aria-label="${text("Zoom in tasks", "\u653E\u5927\u4EFB\u52A1\u753B\u5E03")}">\uFF0B</button><button id="parallel-fit">${text("Show all tasks", "\u663E\u793A\u5168\u90E8\u4EFB\u52A1")}</button><button id="parallel-actual">100%</button></div><span>${text("Scroll to zoom \xB7 Drag to pan \xB7 Select a card for details", "\u6EDA\u8F6E\u7F29\u653E \xB7 \u62D6\u52A8\u5E73\u79FB \xB7 \u70B9\u51FB\u5361\u7247\u770B\u8BE6\u60C5")}</span></footer></section>`;
 }
 function renderUpdates() {
-  return `<div class="task-list-head"><h2>${text("Current work", "\u672C\u6B21\u66F4\u65B0")}</h2><button id="new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button></div>${data.ledger.tasks.length ? data.ledger.tasks.map((t) => `<article class="update-item ${selectedTask === t.id ? "selected-update" : ""}"><button class="update-select" data-update="${esc(t.id)}"><strong>${esc(t.id)} \xB7 ${esc(t.title)}</strong><small>${t.priority} \xB7 ${esc(statusLabel(t.status))}</small><span>${esc(t.description.length > 180 ? t.description.slice(0, 179) + "\u2026" : t.description)}</span><span class="update-next">${text("Owner", "\u8BA4\u9886")}: ${esc(t.owner || text("Unassigned", "\u672A\u767B\u8BB0"))}${t.commit ? " \xB7 " + short(t.commit) : ""}</span></button><button class="update-detail-button" data-update="${esc(t.id)}">${text("Details", "\u8BE6\u60C5")} \u2192</button></article>`).join("") : `<p class="fine">${text("No tasks recorded yet. A can import confirmed Issues or split a request into independently testable tasks.", "\u6682\u65E0\u4EFB\u52A1\u8BB0\u5F55\u3002A \u53EF\u4EE5\u5BFC\u5165\u5DF2\u786E\u8BA4\u7684 Issue\uFF0C\u6216\u5C06\u9700\u6C42\u62C6\u6210\u53EF\u72EC\u7ACB\u9A8C\u6536\u7684\u4EFB\u52A1\u3002")}</p>`}<details class="learning-section"><summary>${text("Source coverage", "\u6E90\u7801\u8986\u76D6\u60C5\u51B5")}</summary><p class="fine">${snapshot()?.files.length || 0} ${text("files indexed", "\u4E2A\u6587\u4EF6\u5DF2\u7D22\u5F15")} \xB7 ${snapshot()?.modules.length || 0} ${text("modules", "\u4E2A\u6A21\u5757")}</p>${snapshot()?.warnings.map((w) => `<p class="fine">${esc(w)}</p>`).join("") || ""}</details>`;
+  return `<div class="task-list-head"><h2>${text("Current work", "\u672C\u6B21\u66F4\u65B0")}</h2><button id="new-task">\uFF0B ${text("New task", "\u65B0\u5EFA\u4EFB\u52A1")}</button></div>${data.ledger.tasks.length ? data.ledger.tasks.map((t) => `<article class="update-item ${selectedTask === t.id ? "selected-update" : ""}"><button class="update-select" data-update="${esc(t.id)}"><strong>${esc(t.id)} \xB7 ${esc(t.title)}</strong><small>${t.priority} \xB7 ${esc(taskStatusLabel(t))}</small><span>${esc(t.description.length > 180 ? t.description.slice(0, 179) + "\u2026" : t.description)}</span><span class="update-next">${text("Owner", "\u8BA4\u9886")}: ${esc(t.owner || text("Unassigned", "\u672A\u767B\u8BB0"))}${t.commit ? " \xB7 " + short(t.commit) : ""}</span></button><button class="update-detail-button" data-update="${esc(t.id)}">${text("Details", "\u8BE6\u60C5")} \u2192</button></article>`).join("") : `<p class="fine">${text("No tasks recorded yet. A can import confirmed Issues or split a request into independently testable tasks.", "\u6682\u65E0\u4EFB\u52A1\u8BB0\u5F55\u3002A \u53EF\u4EE5\u5BFC\u5165\u5DF2\u786E\u8BA4\u7684 Issue\uFF0C\u6216\u5C06\u9700\u6C42\u62C6\u6210\u53EF\u72EC\u7ACB\u9A8C\u6536\u7684\u4EFB\u52A1\u3002")}</p>`}<details class="learning-section"><summary>${text("Source coverage", "\u6E90\u7801\u8986\u76D6\u60C5\u51B5")}</summary><p class="fine">${snapshot()?.files.length || 0} ${text("files indexed", "\u4E2A\u6587\u4EF6\u5DF2\u7D22\u5F15")} \xB7 ${snapshot()?.modules.length || 0} ${text("modules", "\u4E2A\u6A21\u5757")}</p>${snapshot()?.warnings.map((w) => `<p class="fine">${esc(w)}</p>`).join("") || ""}</details>`;
 }
 function renderSelectionEmpty() {
   return `<span class="eyebrow">${text("Source-linked explanations", "\u5173\u8054\u6E90\u7801\u7684\u89E3\u91CA")}</span><h2>${text("Select a module or follow a journey", "\u70B9\u6A21\u5757\uFF0C\u6216\u9010\u6B65\u8D70\u4E00\u6B21\u65C5\u7A0B")}</h2><p>${text("Inspect responsibilities, related connections, source evidence, and actual files. Architecture confidence does not replace independent runtime acceptance.", "\u67E5\u770B\u6A21\u5757\u804C\u8D23\u3001\u5173\u8054\u5173\u7CFB\u3001\u6E90\u7801\u8BC1\u636E\u548C\u5B9E\u9645\u6587\u4EF6\u3002\u67B6\u6784\u53EF\u4FE1\u5EA6\u4E0D\u80FD\u4EE3\u66FF\u72EC\u7ACB\u8FD0\u884C\u9A8C\u6536\u3002")}</p>`;
@@ -745,7 +865,7 @@ function renderTaskDetail(t) {
   if (!t)
     return `<div class="section-label">${text("A \u2192 B \u2192 C \u2192 you", "A \u2192 B \u2192 C \u2192 \u4F60")}</div><p class="description">${text("A scopes the work. B builds. C reviews independently. After integration, C reviews the integrated version before your handtest.", "A \u62C6\u89E3\u4EFB\u52A1\uFF0CB \u5F00\u53D1\uFF0CC \u72EC\u7ACB\u9A8C\u6536\u3002\u96C6\u6210\u7248\u672C\u518D\u6B21\u901A\u8FC7 C \u9A8C\u6536\u540E\uFF0C\u8FDB\u5165\u4F60\u7684\u624B\u6D4B\u3002")}</p><div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "\u590D\u5236")} ${role}</button>`).join("")}</div><div class="section-label">${text("Ledger revision", "\u53F0\u8D26\u7248\u672C")}</div><span class="badge">${data?.ledger.revision}</span><p class="small-print">${text("Task states change through explicit handoff events, never from a chat ending.", "\u4EFB\u52A1\u72B6\u6001\u7531\u660E\u786E\u7684\u4EA4\u63A5\u4E8B\u4EF6\u66F4\u65B0\uFF0C\u4E0D\u901A\u8FC7\u804A\u5929\u7ED3\u675F\u63A8\u65AD\u5B8C\u6210\u3002")}</p>`;
   const review = (r, name) => `<div class="review"><b>${name} \xB7 ${r.passed ? text("Passed", "\u901A\u8FC7") : text("Changes requested", "\u9700\u8FD4\u5DE5")}</b><br>${esc(r.reviewer)} \xB7 ${esc(r.commit)}<br>${esc(r.report)}${r.untested.length ? `<br><span class="pending">${text("Untested", "\u672A\u8986\u76D6")}: ${esc(r.untested.join(", "))}</span>` : ""}<br><span class="muted">${formatDate(r.at)}</span></div>`;
-  return `<span class="badge">${esc(statusLabel(t.status))}</span> <span class="priority ${t.priority}">${t.priority}</span><p class="description">${esc(t.description)}</p><div class="section-label">${text("Acceptance criteria", "\u9A8C\u6536\u6807\u51C6")}</div><ul>${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul><dl class="task-detail">${[
+  return `<div class="task-detail-heading"><h2>${esc(t.title)}</h2><button id="edit-task">${text("Edit task", "\u7F16\u8F91\u4EFB\u52A1")}</button></div><span class="badge">${esc(taskStatusLabel(t))}</span> <span class="priority ${t.priority}">${t.priority}</span><p class="description task-multiline">${esc(t.description)}</p><div class="section-label">${text("Acceptance criteria", "\u9A8C\u6536\u6807\u51C6")}</div><ul>${t.criteria.map((c) => `<li>${esc(c)}</li>`).join("")}</ul><dl class="task-detail">${[
     [
       text("Task / issue", "\u4EFB\u52A1 / Issue"),
       t.id + (t.issue ? " \xB7 " + t.issue : "")
@@ -758,13 +878,14 @@ function renderTaskDetail(t) {
       [t.owner, t.developer, t.integrator, t.reviewer].filter(Boolean).join(" / ") || "\u2014"
     ],
     [text("Dependencies", "\u4F9D\u8D56"), t.dependsOn.join(", ") || "\u2014"],
+    ...t.progress ? [[text("Handoff stage", "\u4EA4\u63A5\u9636\u6BB5"), statusLabel(t.status)]] : [],
     [text("Branch", "\u5206\u652F"), t.branch || "\u2014"],
     [text("Base commit", "\u57FA\u7EBF\u63D0\u4EA4"), t.baseCommit || "\u2014"],
     [text("Development commit", "\u5F00\u53D1\u63D0\u4EA4"), t.commit || "\u2014"],
     [text("Integration commit", "\u96C6\u6210\u63D0\u4EA4"), t.integrationCommit || "\u2014"]
   ].map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join(
     ""
-  )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "\u9A8C\u6536\u8BC1\u636E")}</div>${t.reviews.map((r, i) => review(r, `${text("C review", "C \u9A8C\u6536")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "\u5C1A\u65E0\u72EC\u7ACB\u9A8C\u6536\u8BB0\u5F55\u3002")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "\u96C6\u6210\u9A8C\u6536")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "\u7528\u6237\u786E\u8BA4")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "\u590D\u5236")} ${role}</button>`).join("")}</div><button id="edit-task" class="file-open">${text("Edit / submit handoff", "\u7F16\u8F91 / \u63D0\u4EA4\u4EA4\u63A5\u8BB0\u5F55")}</button><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "\u9A8C\u6536\u5FC5\u987B\u7ED1\u5B9A\u5B9E\u9645\u63D0\u4EA4\u3002\u53EA\u6709\u7528\u6237\u80FD\u786E\u8BA4\u624B\u6D4B\u901A\u8FC7\u3002")}</p>`;
+  )}</dl>${t.blocked ? `<p class="description pending">${text("Blocked", "\u963B\u585E")}: ${esc(t.blocked)}</p>` : ""}<div class="section-label">${text("Review evidence", "\u9A8C\u6536\u8BC1\u636E")}</div>${t.acceptanceNotes ? `<div class="review"><b>${text("Manual notes", "\u8865\u5145\u8BB0\u5F55")}</b><p class="task-multiline">${esc(t.acceptanceNotes)}</p></div>` : ""}${t.reviews.map((r, i) => review(r, `${text("C review", "C \u9A8C\u6536")} ${i + 1}`)).join("") || `<p class="description">${text("No independent review yet.", "\u5C1A\u65E0\u72EC\u7ACB\u9A8C\u6536\u8BB0\u5F55\u3002")}</p>`}${t.integrationReview ? review(t.integrationReview, text("Integration review", "\u96C6\u6210\u9A8C\u6536")) : ""}${t.userAcceptance ? `<div class="review"><b>${text("User acceptance", "\u7528\u6237\u786E\u8BA4")}</b><br>${esc(t.userAcceptance.commit)}<br>${esc(t.userAcceptance.source)}<br>${formatDate(t.userAcceptance.at)}</div>` : ""}<div class="role-buttons">${["A", "B", "C"].map((role) => `<button data-role="${role}">${text("Copy", "\u590D\u5236")} ${role}</button>`).join("")}</div><p class="small-print">${text("Every review must name its exact commit. Only the user can confirm handtest acceptance.", "\u9A8C\u6536\u5FC5\u987B\u7ED1\u5B9A\u5B9E\u9645\u63D0\u4EA4\u3002\u53EA\u6709\u7528\u6237\u80FD\u786E\u8BA4\u624B\u6D4B\u901A\u8FC7\u3002")}</p>`;
 }
 function locateFile(path, files) {
   if (!snapshot()?.files.some((file) => file.path === path)) {
@@ -835,15 +956,19 @@ function showJourney(index) {
   const trails = j.steps.map((step) => moduleTrail(step.moduleId).slice(0, -1));
   const common = trails[0]?.filter((m) => trails.every((trail) => trail.some((n) => n.id === m.id))).at(-1)?.id || "";
   const parent = nextStep ? moduleById(nextStep.moduleId)?.parentId || "" : common;
-  navigateMap(parent);
+  navigateMap(parent, "", false);
   tab = "journeys";
   journeyStep = Math.max(-1, Math.min(j.steps.length - 1, index));
   selectedTask = "";
   selectedModule = journeyStep >= 0 ? j.steps[journeyStep].moduleId : "";
   for (const step of j.steps) {
     const m = moduleById(step.moduleId);
-    if (m) collapsed.delete(m.kind || "source");
+    if (m) {
+      if (!m.parentId && indexedDirectoryCount() && isIndexedDirectory(m)) showIndexedDirectories = true;
+      collapsed.delete(m.kind || "source");
+    }
   }
+  initialFit = true;
   render();
   if (selectedModule) focusModule(selectedModule);
   else fitGraph();
@@ -852,6 +977,13 @@ function bind() {
   const on = (id, fn) => document.getElementById(id)?.addEventListener("click", fn);
   on("map-up", () => navigateMap(callRoot ? mapParent : moduleById(mapParent)?.parentId || ""));
   on("show-call-chain", () => navigateMap(mapParent, selectedModule));
+  on("indexed-directories", () => {
+    showIndexedDirectories = !showIndexedDirectories;
+    if (showIndexedDirectories) collapsed.delete("directory");
+    render();
+    fitGraph();
+    document.getElementById("indexed-directories")?.focus();
+  });
   document.querySelectorAll("[data-symbol-target]").forEach(
     (el) => el.addEventListener("click", () => {
       const id = el.dataset.symbolTarget, m = moduleById(id);
@@ -924,6 +1056,12 @@ function bind() {
     viewMode = "parallel";
     render();
   });
+  document.querySelector("#parallel-grouping")?.addEventListener("change", (e) => {
+    parallelGrouping = e.target.value === "dependency" ? "dependency" : "module";
+    render();
+    fitBoard();
+    document.getElementById("parallel-grouping")?.focus();
+  });
   on("dev-map-open", () => {
     viewMode = "map";
     render();
@@ -981,11 +1119,13 @@ function bind() {
     });
   });
   document.querySelector("#version-picker")?.addEventListener("change", (e) => {
+    if (layoutSaveTimer !== void 0) rememberMap();
     source = e.target.value;
     mapParent = "";
     callRoot = "";
     layoutKey = "";
     mapLocations.clear();
+    showIndexedDirectories = false;
     selectedModule = "";
     selectedFile = "";
     selectedJourney = "";
@@ -1067,7 +1207,7 @@ function fitView(width, height, bounds, max = 1.1) {
     y: (height - bounds.height * scale) / 2 - bounds.y * scale
   };
 }
-function zoom(factor, x, y, board = false) {
+function zoom(factor, x, y, board = false, wheel = false) {
   const current = board ? boardView : view;
   const vp = document.getElementById(board ? "parallel-viewport" : "viewport");
   if (!vp) return;
@@ -1085,7 +1225,11 @@ function zoom(factor, x, y, board = false) {
   };
   if (board) boardView = next;
   else view = next;
-  paintView(board);
+  paintView(board, !wheel);
+  if (!board && wheel) {
+    clearTimeout(layoutSaveTimer);
+    layoutSaveTimer = setTimeout(rememberMap, 150);
+  }
 }
 function paintView(board = false, persist = true) {
   if (!board && persist) rememberMap();
@@ -1139,7 +1283,9 @@ function focusModule(id) {
     fitGraph();
     return;
   }
-  collapsed.delete(m.kind || "source");
+  const revealDirectory = !showIndexedDirectories && indexedDirectoryCount() && isIndexedDirectory(m);
+  if (revealDirectory) showIndexedDirectories = true;
+  const expanded = collapsed.delete(m.kind || "source");
   const p = nodePos(m);
   view = fitView(
     vp.clientWidth,
@@ -1147,7 +1293,7 @@ function focusModule(id) {
     { ...p, width: 316, height: 124 },
     1
   );
-  render();
+  if (expanded || revealDirectory) render();
   paintView();
 }
 function moveGroup(id, dx, dy) {
@@ -1239,6 +1385,7 @@ function bindCanvas(board = false) {
     if (drag || ev.button !== 0 || !ev.isPrimary || ev.target.closest("[data-group],.map-empty")) return;
     const node = ev.target.closest("[data-node]"), group = ev.target.closest("[data-drag-group]");
     if (board && ev.target.closest("button")) return;
+    if (!board && layoutSaveTimer !== void 0) rememberMap();
     if (!node) lastNodeClick = null;
     const current = board ? boardView : view;
     current.x -= vp.scrollLeft;
@@ -1252,13 +1399,13 @@ function bindCanvas(board = false) {
     })) : [];
     const points = new Map(layout.flatMap((l) => [...l.positions]));
     const affected = new Set(node ? [node.dataset.node] : layout.find((l) => l.group.id === group?.dataset.dragGroup)?.group.modules.map((m) => m.id) || []);
-    const paths = [...vp.querySelectorAll("path.edge,path.containment")].map((element) => ({
+    const paths = affected.size ? [...vp.querySelectorAll("path.edge,path.containment")].map((element) => ({
       element,
       from: element.dataset.from || element.dataset.owner || "",
       to: element.dataset.to || element.dataset.member || "",
       type: element.classList.contains("containment") || element.dataset.route === "type",
       index: Number(element.dataset.routeIndex || 0)
-    })).filter((p) => points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to)));
+    })).filter((p) => points.has(p.from) && points.has(p.to) && (affected.has(p.from) || affected.has(p.to))) : [];
     drag = {
       type: node ? "node" : group ? "group" : "pan",
       id: node?.dataset.node || group?.dataset.dragGroup || "",
@@ -1307,7 +1454,8 @@ function bindCanvas(board = false) {
         Math.exp(-Math.max(-100, Math.min(100, delta)) * 25e-4),
         ev.clientX - rect.left,
         ev.clientY - rect.top,
-        board
+        board,
+        true
       );
     },
     { passive: false }
@@ -1661,49 +1809,190 @@ function openRoles(initial = "A") {
 function openTask(task) {
   if (!data) return;
   const revision = data.ledger.revision;
-  const shell = openModal(
-    task ? text("Submit a task handoff.", "\u63D0\u4EA4\u4EFB\u52A1\u4EA4\u63A5\u3002") : text("Make the next step clear.", "\u628A\u4E0B\u4E00\u6B65\u8BF4\u6E05\u695A\u3002"),
-    `<form id="task-form">${task ? `<p>${text("Edit the complete task record. The service validates ownership, status transitions, exact commits, and independent review evidence. Revision conflicts require reloading.", "\u7F16\u8F91\u5B8C\u6574\u4EFB\u52A1\u8BB0\u5F55\u3002\u670D\u52A1\u4F1A\u9A8C\u8BC1\u8BA4\u9886\u3001\u72B6\u6001\u6D41\u8F6C\u3001\u63D0\u4EA4\u7248\u672C\u548C\u72EC\u7ACB\u9A8C\u6536\u8BC1\u636E\u3002\u7248\u672C\u51B2\u7A81\u65F6\u9700\u8981\u91CD\u65B0\u8F7D\u5165\u3002")}</p><div class="form-row"><label for="task-json">${text("Versioned task record \xB7 JSON", "\u7248\u672C\u5316\u4EFB\u52A1\u8BB0\u5F55 \xB7 JSON")}</label><textarea id="task-json" name="task-json" spellcheck="false" style="min-height:330px;font-family:ui-monospace,monospace;font-size:11px">${esc(JSON.stringify(task, null, 2))}</textarea></div>` : `<div class="form-row"><label for="task-title">${text("Task title", "\u4EFB\u52A1\u6807\u9898")}</label><input id="task-title" name="task-title" required maxlength="240" placeholder="${text("What should change?", "\u9700\u8981\u6539\u53D8\u4EC0\u4E48\uFF1F")}"></div><div class="form-row"><label for="task-description">${text("Context & expected behavior", "\u80CC\u666F\u4E0E\u9884\u671F\u884C\u4E3A")}</label><textarea id="task-description" name="task-description" required></textarea></div><div class="form-grid form-row"><div><label for="task-priority">${text("Priority", "\u4F18\u5148\u7EA7")}</label><select id="task-priority" name="task-priority"><option>P1</option><option>P0</option><option>P2</option></select></div><div><label for="task-issue">${text("Issue URL or reference (optional)", "Issue \u5730\u5740\u6216\u7F16\u53F7\uFF08\u53EF\u9009\uFF09")}</label><input id="task-issue" name="task-issue" placeholder="#12"></div></div><div class="form-row"><label for="task-criteria">${text("Acceptance criteria \xB7 one per line", "\u9A8C\u6536\u6807\u51C6 \xB7 \u6BCF\u884C\u4E00\u6761")}</label><textarea id="task-criteria" name="task-criteria" required></textarea></div>`}<div class="form-grid form-row"><div><label for="task-actor">${text("Recorded actor", "\u8BB0\u5F55\u64CD\u4F5C\u8005")}</label><input id="task-actor" name="task-actor" value="${task ? "" : "user"}" placeholder="${text("Your role / session identifier", "\u4F60\u7684\u89D2\u8272 / \u4F1A\u8BDD\u6807\u8BC6")}" required maxlength="160"></div><div><label>${text("Ledger revision", "\u53F0\u8D26\u7248\u672C")}</label><p class="description">${revision}</p></div></div><p id="task-error" role="alert" class="description danger"></p><div class="form-actions"><button class="primary" type="submit">${task ? text("Submit handoff", "\u63D0\u4EA4\u4EA4\u63A5") : text("Create task", "\u521B\u5EFA\u4EFB\u52A1")}</button></div></form>`
-  );
-  shell.querySelector("#task-form").addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    const form = new FormData(ev.target);
-    try {
-      let next;
-      if (task) {
-        next = JSON.parse(String(form.get("task-json")));
-        if (next.id !== task.id)
-          throw new Error(
-            text("Task ID must remain unchanged.", "\u4EFB\u52A1 ID \u4E0D\u80FD\u6539\u53D8\u3002")
-          );
-      } else {
-        next = {
-          id: `TASK-${crypto.randomUUID().slice(0, 8)}`,
-          title: String(form.get("task-title")).trim(),
-          description: String(form.get("task-description")).trim(),
-          priority: form.get("task-priority"),
-          status: "todo",
-          criteria: String(form.get("task-criteria")).split("\n").map((s) => s.trim()).filter(Boolean),
-          dependsOn: [],
-          files: [],
-          reviews: [],
-          updatedAt: (/* @__PURE__ */ new Date()).toISOString()
-        };
-        const issue = String(form.get("task-issue") || "").trim();
-        if (issue) next.issue = issue;
+  const currentStatus = task?.status || "todo";
+  const input = (field, label, value = "", attributes = "") => `<label for="task-${field}">${label}</label><input id="task-${field}" name="task-${field}" value="${esc(value)}" ${attributes}>`;
+  const textarea = (field, label, value = "", attributes = "") => `<label for="task-${field}">${label}</label><textarea id="task-${field}" name="task-${field}" ${attributes}>${esc(value)}</textarea>`;
+  const options = (values, value, label) => values.map((option) => `<option value="${esc(option)}" ${value === option ? "selected" : ""}>${esc(label(option))}</option>`).join("");
+  const shell = openModal(task ? text("Edit task", "\u7F16\u8F91\u4EFB\u52A1") : text("New task", "\u65B0\u5EFA\u4EFB\u52A1"), `
+    <form id="task-form">
+      ${task ? `<p class="fine">${esc(task.id)}</p>` : ""}
+      <div class="form-row">${input("title", text("Task title", "\u4EFB\u52A1\u540D\u79F0"), task?.title, 'required maxlength="240"')}</div>
+      <div class="form-grid form-row">
+        <div>${input("module", text("Module (optional)", "\u6240\u5C5E\u6A21\u5757\uFF08\u53EF\u9009\uFF09"), task?.module, 'maxlength="80"')}</div>
+        <div><label for="task-priority">${text("Priority", "\u4F18\u5148\u7EA7")}</label><select id="task-priority" name="task-priority">${options(["P1", "P0", "P2"], task?.priority || "P1", (value) => value)}</select></div>
+      </div>
+      ${task ? `
+        <div class="form-grid form-row">
+          <div><label for="task-progress">${text("Board status", "\u770B\u677F\u72B6\u6001")}</label><select id="task-progress" name="task-progress">${options(["", ...taskProgressOptions], task.progress || "", (value) => value ? progressLabel(value) : text("Follow handoff stage", "\u8DDF\u968F\u4EA4\u63A5\u9636\u6BB5"))}</select></div>
+          <div>${input("branch", text("Branch", "\u5206\u652F"), task.branch)}</div>
+        </div>
+        <p id="task-scope-help" class="fine" hidden>${text("The review scope is frozen. Restart development from rework to revise it.", "\u9A8C\u6536\u8303\u56F4\u5DF2\u9501\u5B9A\u3002\u9000\u56DE\u8FD4\u5DE5\u5E76\u91CD\u65B0\u5F00\u53D1\u65F6\u53EF\u4FEE\u8BA2\u3002")}</p>
+      ` : ""}
+      <div class="form-row">${textarea("description", text("Task description", "\u4EFB\u52A1\u63CF\u8FF0"), task?.description, task ? "" : "required")}</div>
+      <div class="form-row">${textarea("criteria", text("Acceptance criteria \xB7 one per line", "\u9A8C\u6536\u6807\u51C6 \xB7 \u6BCF\u884C\u4E00\u6761"), task?.criteria.join("\n"), task ? "" : "required")}</div>
+      <div class="form-row">${textarea("acceptance-notes", text("Acceptance evidence \xB7 notes", "\u9A8C\u6536\u8BC1\u636E \xB7 \u8865\u5145\u8BB0\u5F55"), task?.acceptanceNotes, 'maxlength="12000"')}</div>
+      ${task ? `
+        <details id="task-assignment" class="form-row">
+          <summary>${text("Ownership, scope & references", "\u5206\u5DE5\u3001\u8303\u56F4\u548C\u53C2\u8003")}</summary>
+          <div class="form-grid form-row">
+            <div>${input("owner", text("Owner", "\u8BA4\u9886\u4EBA"), task.owner)}</div>
+            <div>${input("developer", text("Developer", "\u5F00\u53D1\u8005"), task.developer)}</div>
+            <div>${input("reviewer", text("Assigned reviewer", "\u9A8C\u6536\u4EBA"), task.reviewer)}</div>
+            <div>${input("base-commit", text("Base commit", "\u57FA\u7EBF\u63D0\u4EA4"), task.baseCommit)}</div>
+            <div>${input("issue", text("Issue reference", "Issue \u7F16\u53F7\u6216\u5730\u5740"), task.issue)}</div>
+            <div>${input("blocked", text("Blocker", "\u963B\u585E\u8BF4\u660E"), task.blocked)}</div>
+          </div>
+          <div class="form-row">${textarea("files", text("File scope \xB7 one per line", "\u6587\u4EF6\u8303\u56F4 \xB7 \u6BCF\u884C\u4E00\u6761"), task.files.join("\n"))}</div>
+          <div class="form-row">${textarea("depends-on", text("Prerequisite IDs \xB7 one per line", "\u524D\u7F6E\u4EFB\u52A1 ID \xB7 \u6BCF\u884C\u4E00\u6761"), task.dependsOn.join("\n"))}</div>
+        </details>
+        <details id="task-workflow" class="form-row">
+          <summary>${text("A/B/C handoff", "A/B/C \u4EA4\u63A5")} \xB7 ${esc(statusLabel(currentStatus))}</summary>
+          <div class="form-row"><label for="task-status">${text("Handoff stage", "\u4EA4\u63A5\u9636\u6BB5")}</label><select id="task-status" name="task-status">${options([currentStatus, ...taskTransitions[currentStatus]], currentStatus, statusLabel)}</select></div>
+          <fieldset id="task-freeze-step" class="task-transition" hidden disabled>
+            <div class="form-row">${input("version", "", "", 'required pattern="[0-9a-fA-F]{40}" maxlength="40" spellcheck="false"')}</div>
+          </fieldset>
+          <fieldset id="task-review-step" class="task-transition" hidden disabled>
+            <p class="fine">${text("Review commit", "\u9A8C\u6536\u63D0\u4EA4")} <code>${esc(currentStatus === "integration-review" ? task.integrationCommit : task.commit)}</code></p>
+            <div class="form-row">${textarea("review-report", text("Independent review report", "\u72EC\u7ACB\u9A8C\u6536\u62A5\u544A"), "", "required")}</div>
+            <div class="form-row">${textarea("untested", text("Untested items \xB7 one per line", "\u672A\u9A8C\u8BC1\u9879 \xB7 \u6BCF\u884C\u4E00\u6761"))}</div>
+          </fieldset>
+          <fieldset id="task-handtest-step" class="task-transition" hidden disabled>
+            <p class="fine">${text("Handtest commit", "\u624B\u6D4B\u63D0\u4EA4")} <code>${esc(task.integrationCommit)}</code></p>
+            <div class="form-row">${textarea("handtest-source", text("User handtest result and evidence", "\u7528\u6237\u624B\u6D4B\u7ED3\u679C\u53CA\u4F9D\u636E"), "", "required")}</div>
+          </fieldset>
+        </details>
+      ` : `<div class="form-row">${input("issue", text("Issue reference (optional)", "Issue \u7F16\u53F7\u6216\u5730\u5740\uFF08\u53EF\u9009\uFF09"))}</div>`}
+      <div class="form-row">${input("actor", text("Recorded actor", "\u8BB0\u5F55\u64CD\u4F5C\u8005"), "user", 'required maxlength="160"')}</div>
+      <p id="task-error" role="alert" class="description danger"></p>
+      <div class="form-actions">
+        <button type="button" id="task-cancel">${text("Cancel", "\u53D6\u6D88")}</button>
+        <button class="primary" type="submit">${task ? text("Save changes", "\u4FDD\u5B58\u4FEE\u6539") : text("Create task", "\u521B\u5EFA\u4EFB\u52A1")}</button>
+      </div>
+    </form>`);
+  const form = shell.querySelector("#task-form");
+  const workflow = form.querySelector("#task-status");
+  const actorField = form.querySelector("#task-actor");
+  form.addEventListener("invalid", (event) => {
+    const details = event.target.closest("details");
+    if (details) details.open = true;
+  }, true);
+  const workflowStatus = () => workflow?.value || currentStatus;
+  const isReview = () => workflowStatus() !== currentStatus && (currentStatus === "review" || currentStatus === "integration-review");
+  let customActor = false;
+  actorField.addEventListener("input", () => {
+    customActor = true;
+  });
+  if (task && workflow) {
+    const step = (name, visible) => {
+      const fieldset = form.querySelector(`#task-${name}-step`);
+      fieldset.hidden = !visible;
+      fieldset.disabled = !visible;
+    };
+    const syncStatus = () => {
+      const next = workflowStatus();
+      const advancing = currentStatus !== next;
+      const scopeEditable = canEditTaskScope(currentStatus, next);
+      const owner = form.querySelector("#task-owner");
+      const developer = form.querySelector("#task-developer");
+      developer.readOnly = currentStatus !== "todo" && !(currentStatus === "rework" && next === "developing");
+      for (const name of ["description", "criteria", "files", "depends-on"]) {
+        form.querySelector(`#task-${name}`).readOnly = !scopeEditable;
       }
-      await api("/api/tasks", {
-        revision,
-        actor: String(form.get("task-actor")).trim(),
-        task: next
+      form.querySelector("#task-scope-help").hidden = scopeEditable;
+      step("freeze", advancing && (next === "review" || next === "integrated"));
+      form.querySelector('label[for="task-version"]').textContent = next === "integrated" ? text("Integration commit \xB7 full SHA", "\u96C6\u6210\u63D0\u4EA4 \xB7 \u5B8C\u6574 SHA") : text("Development commit \xB7 full SHA", "\u5F00\u53D1\u63D0\u4EA4 \xB7 \u5B8C\u6574 SHA");
+      step("review", isReview());
+      step("handtest", advancing && next === "done");
+      if (!customActor) {
+        actorField.value = isReview() ? "" : !advancing || next === "done" ? "user" : owner.value || "user";
+      }
+      if (advancing && next === "developing") {
+        form.querySelector("#task-assignment").open = true;
+        owner.placeholder = actorField.value;
+        developer.placeholder = owner.value || actorField.value;
+      }
+    };
+    workflow.addEventListener("change", syncStatus);
+    syncStatus();
+  }
+  shell.querySelector("#task-cancel").addEventListener("click", closeModal);
+  const submit = form.querySelector('[type="submit"]');
+  const message = form.querySelector("#task-error");
+  const initial = new FormData(form);
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    if (submit.disabled) return;
+    submit.disabled = true;
+    message.textContent = "";
+    const values = new FormData(form);
+    const value = (name) => String(values.get(`task-${name}`) ?? "").trim();
+    const lines = (name) => value(name).split("\n").map((line) => line.trim()).filter(Boolean);
+    const changed = (name) => values.get(`task-${name}`) !== initial.get(`task-${name}`);
+    const edited = (name, previous) => !task || changed(name) ? value(name) || void 0 : previous;
+    const actor = value("actor");
+    const at = (/* @__PURE__ */ new Date()).toISOString();
+    const next = {
+      ...task || { id: `TASK-${crypto.randomUUID().slice(0, 8)}`, criteria: [], files: [], dependsOn: [], reviews: [] },
+      title: edited("title", task?.title) || "",
+      module: edited("module", task?.module),
+      priority: value("priority"),
+      status: workflowStatus(),
+      description: task?.description || "",
+      acceptanceNotes: edited("acceptance-notes", task?.acceptanceNotes),
+      issue: edited("issue", task?.issue),
+      updatedAt: at
+    };
+    if (canEditTaskScope(currentStatus, next.status)) {
+      next.description = edited("description", task?.description) || "";
+      if (!task || changed("criteria")) next.criteria = lines("criteria");
+      if (!task || changed("files")) next.files = lines("files");
+      if (!task || changed("depends-on")) next.dependsOn = lines("depends-on");
+    }
+    if (task) {
+      if (changed("progress")) next.progress = value("progress") || null;
+      Object.assign(next, {
+        branch: edited("branch", task.branch),
+        owner: edited("owner", task.owner),
+        developer: edited("developer", task.developer),
+        reviewer: edited("reviewer", task.reviewer),
+        baseCommit: edited("base-commit", task.baseCommit),
+        blocked: edited("blocked", task.blocked)
       });
+      if (currentStatus !== next.status) {
+        if (next.status === "developing") {
+          next.owner ||= actor;
+          next.developer ||= next.owner;
+        }
+        if (next.status === "review") next.commit = value("version");
+        if (next.status === "integrated") next.integrationCommit = value("version");
+        if (isReview()) {
+          const review = {
+            reviewer: actor,
+            commit: currentStatus === "integration-review" ? task.integrationCommit : task.commit,
+            passed: next.status !== "rework",
+            report: value("review-report"),
+            untested: lines("untested"),
+            at
+          };
+          if (currentStatus === "integration-review") next.integrationReview = review;
+          else next.reviews = [...task.reviews, review];
+        }
+        if (next.status === "done") {
+          next.userAcceptance = { commit: task.integrationCommit, source: value("handtest-source"), at };
+        }
+      }
+    }
+    try {
+      await api("/api/tasks", { revision, actor, task: next });
       selectedTask = next.id;
-      viewMode = "parallel";
-      closeModal();
+      if (!task) viewMode = "parallel";
+      if (shell.isConnected) closeModal();
       await refresh();
       toast(text("Task ledger updated.", "\u4EFB\u52A1\u53F0\u8D26\u5DF2\u66F4\u65B0\u3002"));
     } catch (e) {
-      shell.querySelector("#task-error").textContent = e instanceof Error ? e.message : String(e);
+      message.textContent = e instanceof Error ? e.message : String(e);
+    } finally {
+      submit.disabled = false;
     }
   });
 }
@@ -1751,4 +2040,7 @@ events.onopen = () => {
 };
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) void refresh();
+});
+window.addEventListener("pagehide", () => {
+  if (layoutSaveTimer !== void 0) rememberMap();
 });
